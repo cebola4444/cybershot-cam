@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\Usuário\\\\Documents\\\\PlatformIO\\\\Projects\\\\cybershot-cam\" -Force | Where-Object { $_.Name -notmatch \"^\\\\.pio\" } | Select-Object Name, @{Name=\"Type\";Expression={if\\($_.PSIsContainer\\){\"DIR\"}else{\"FILE\"}}} | Format-Table -AutoSize)",
-      "mcp__visualize__read_me"
-    ]
-  }
-}
