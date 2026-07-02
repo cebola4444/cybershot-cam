@@ -197,7 +197,7 @@ SPIClass        tftSPI(FSPI);
 Adafruit_ST7735 tft(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 WebServer server(80);
 
-// ─── Camera ───────────────────────────────────────────────────────────────────
+// ─── Câmera ───────────────────────────────────────────────────────────────────
 
 bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
     esp_camera_deinit();
@@ -238,7 +238,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
         s->set_hmirror(s, 1);
         s->set_brightness(s, 1);
         s->set_gainceiling(s, GAINCEILING_128X);
-        s->set_exposure_ctrl(s, 0);  // sempre manual — valores controlados pelo código
+        s->set_exposure_ctrl(s, 0);  // exposição manual — controlada pelo código
         s->set_gain_ctrl(s, 0);
 
         if (fmt == PIXFORMAT_RGB565) {
@@ -246,11 +246,10 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_aec_value(s, vfAecValue);
             s->set_agc_gain(s, vfAgcGain);
         } else {
-            // Captura normal: XCLK=20 MHz é 2× mais rápido que VF (10 MHz).
-            // Dobrar aec_value mantém o mesmo tempo de exposição absoluto.
-            s->set_whitebal(s, 1);    // AWB ligado na captura — corrige dominância de cor
+            // XCLK=20 MHz (2× do VF); dobra aec_value para manter exposição equivalente
+            s->set_whitebal(s, 1);    // AWB ligado — corrige dominância de cor
             s->set_awb_gain(s, 1);
-            s->set_wb_mode(s, 0);     // modo auto
+            s->set_wb_mode(s, 0);     // balanço automático
             s->set_aec_value(s, min(1200, vfAecValue * 2));
             s->set_agc_gain(s, vfAgcGain);
         }
@@ -258,7 +257,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     return true;
 }
 
-// ─── Viewfinder ───────────────────────────────────────────────────────────────
+// ─── Viewfinder / VF ─────────────────────────────────────────────────────────
 
 void toGreenTones(uint8_t* buf, int w, int h) {
     const uint16_t* pal = vfPalettes[vfColorIdx];
@@ -352,7 +351,7 @@ void drawViewfinderOverlay() {
     }
 }
 
-// ─── Forward declarations ─────────────────────────────────────────────────────
+// ─── Declarações antecipadas ─────────────────────────────────────────────────
 
 void handleRoot();
 void handleFoto();
@@ -363,7 +362,7 @@ void handleSDFile();
 
 void setupWebServer();   // forward declaration
 
-// ─── NVS helpers ─────────────────────────────────────────────────────────────
+// ─── NVS: salvar/carregar credenciais ────────────────────────────────────────
 
 void saveWiFiCreds(const String& ssid, const String& pass) {
     wifiPrefs.begin("wifi", false);
@@ -601,46 +600,22 @@ bool saveToSD(const uint8_t* buf, size_t len, char* nameOut) {
     return true;
 }
 
-// ─── Glitch: DQT frequency erosion ───────────────────────────────────────────
-//
-// Derive a 0.0–1.0 "darkness factor" from the exposure state at capture time.
-// Dark scenes (high AEC/gain) → higher factor → more aggressive frequency erosion.
-// Bright scenes → subtle erosion of only the highest frequencies.
+// ─── Glitch: erosão de frequência DQT ────────────────────────────────────────
+// Fator de intensidade do glitch baseado na exposição atual (0=sutil, 1=agressivo).
 static float glitchFactor() {
     float aec  = (float)vfAecValue / 1200.0f;
     float gain = (float)vfAgcGain  / 30.0f;
     return constrain(aec * 0.35f + gain * 0.65f, 0.05f, 0.95f);
 }
 
-// Modifies DQT quantization tables in-place inside the JPEG buffer.
-//
-// Works with absolute values instead of relative multiplication — necessary
-// because quality=12 JPEG already has high quantization values, making
-// multiplication ineffective. Instead, we SET coefficients directly:
-//
-//   k=0  (DC):        untouched — preserves overall brightness per block
-//   k=1..cutLow:      set to 1 (minimum) → decoder amplifies these components
-//                     enormously → strong blocking, posterization, tonal jumps
-//   k=cutLow..cutHi:  untouched — transition band
-//   k=cutHi..63:      set to 255 (maximum) → decoder zeroes these out → no texture
-//
-// The two cut points are driven by gf:
-//   gf low  → narrow low-freq band set to 1, most frequencies untouched (subtle)
-//   gf high → wide low-freq band set to 1, wide high-freq band set to 255 (aggressive)
-//
-// Setting low-freq coefs to 1 is the key insight: the encoder wrote coefficients
-// already scaled by the original (high) quant value. The decoder divides by the
-// quant value in the file — if we write 1 here, the decoder multiplies by 1/original
-// of what it expects, producing DC-level jumps between 8x8 blocks: posterization.
+// Modifica tabelas DQT do JPEG: freq baixas → quant=1 (amplifica), altas → quant=255 (apaga).
 void applyGlitchDQT(uint8_t* buf, size_t len) {
     float gf = glitchFactor();
 
-    // low-freq cut: k indices 1..cutLow get set to 1
-    // gf=0.05 → cutLow=1 (barely anything); gf=0.95 → cutLow=18
+    // corte de freq baixa: k=1..cutLow → quant=1 (gf alto = faixa maior)
     int cutLow = (int)(gf * 19.0f);
 
-    // high-freq cut: k indices cutHi..63 get set to 255
-    // gf=0.05 → cutHi=62 (almost nothing); gf=0.95 → cutHi=32
+    // corte de freq alta: k=cutHi..63 → quant=255 (gf alto = faixa maior)
     int cutHi = 63 - (int)(gf * 31.0f);
 
     int i = 0;
@@ -659,10 +634,10 @@ void applyGlitchDQT(uint8_t* buf, size_t len) {
 
             for (int k = 0; k < 64; k++) {
                 uint8_t newVal = 0;
-                if      (k == 0)              newVal = buf[pos];   // DC: keep
-                else if (k <= cutLow)         newVal = 1;          // low-freq: min quant → max decoder amplification
-                else if (k >= cutHi)          newVal = 255;        // high-freq: max quant → zeroed out
-                else                          newVal = buf[pos];   // transition band: keep
+                if      (k == 0)              newVal = buf[pos];   // DC: preserva
+                else if (k <= cutLow)         newVal = 1;          // baixa freq: amplifica
+                else if (k >= cutHi)          newVal = 255;        // alta freq: apaga
+                else                          newVal = buf[pos];   // transição: preserva
 
                 if (precision) {
                     buf[pos]     = 0;
@@ -679,22 +654,10 @@ void applyGlitchDQT(uint8_t* buf, size_t len) {
     }
 }
 
-// ─── Glitch: scan data transplant ────────────────────────────────────────────
-//
-// The OV2640 does not emit restart markers, so segmentation is done
-// proportionally: the scan bitstream is treated as N equal-sized virtual
-// "bands" mapped to image height. Overwriting one band's bytes with another's
-// de-syncs the Huffman decoder at that point — it tries to parse the wrong
-// bitstream and produces cascading color drift, brightness smear, and block
-// echo artifacts that propagate until it finds a valid code pattern again.
-// This cascade is the VHS head-misalignment look.
-//
-// Two transplants are performed at positions derived from the image's own
-// exposure values (vfAecValue → upper transplant, vfAgcGain → lower).
-// The donor region is offset by ~1/4 of scan length from the recipient,
-// so the "echo" comes from a meaningfully different part of the scene.
+// ─── Glitch: transplante de dados de scan ────────────────────────────────────
+// Sobrescreve trechos do bitstream de scan com dados de outra região → dessincroniza Huffman → artefatos VHS.
 void applyGlitchScan(uint8_t* buf, size_t len) {
-    // ── 1. Locate scan data (SOS marker) ──────────────────────────────────
+    // localiza dados de scan (SOS)
     int scanStart = -1;
     for (int i = 0; i < (int)len - 3; i++) {
         if (buf[i] == 0xFF && buf[i + 1] == 0xDA) {
@@ -704,7 +667,7 @@ void applyGlitchScan(uint8_t* buf, size_t len) {
     }
     if (scanStart < 0) return;
 
-    // ── 2. Locate EOI to bound scan data ──────────────────────────────────
+    // fim do scan (EOI)
     int scanEnd = (int)len - 2;
     for (int i = (int)len - 2; i >= scanStart; i--) {
         if (buf[i] == 0xFF && buf[i + 1] == 0xD9) { scanEnd = i; break; }
@@ -712,13 +675,7 @@ void applyGlitchScan(uint8_t* buf, size_t len) {
     int scanLen = scanEnd - scanStart;
     if (scanLen < 512) return;
 
-    // ── 3. Randomized glitch parameters (controlled variation per shot) ───
-    //
-    //   nTransplants : 2–6   number of cut points
-    //   divisor      : 8–24  band width = scanLen / divisor
-    //   donorPct     : 25–66 donor offset as % of scanLen
-    //
-    // esp_random() uses the ESP32 hardware RNG — no seed needed.
+    // parâmetros aleatórios (RNG de hardware do ESP32)
     uint32_t rng = esp_random();
     int nTransplants = 2   + (int)((rng & 0xFF)         % 3);       // 2..4
     int divisor      = 8   + (int)(((rng >> 8)  & 0xFF) % 11);      // 8..18
@@ -733,7 +690,7 @@ void applyGlitchScan(uint8_t* buf, size_t len) {
     Serial.printf("[glitch] transplants=%d  divisor=/%d  donor=%d%%\n",
                   nTransplants, divisor, donorPct);
 
-    // ── 4. Perform transplants ─────────────────────────────────────────────
+    // aplica os transplantes
     for (int t = 0; t < nTransplants; t++) {
         float base = (float)t / nTransplants
                    + (t % 2 == 0 ? aecNorm : gainNorm) * (1.0f / nTransplants * 0.6f);
@@ -746,34 +703,14 @@ void applyGlitchScan(uint8_t* buf, size_t len) {
     }
 }
 
-// ─── Glitch: chroma DQT amplification ────────────────────────────────────────
-//
-// JPEG stores color in YCbCr with separate DQT tables: table ID 0 = luma (Y),
-// table ID 1 = chroma (Cb/Cr). Leaving luma untouched preserves all structure,
-// edges, and brightness. Manipulating only the chroma table produces purely
-// chromatic distortion — the image stays sharp and recognizable but colors
-// bleed, oversaturate, and misregister like offset printing with wrong ink density.
-//
-// Approach A — chroma DC + low-freq amplification:
-//   Set DC (k=0) and low-frequency chroma coefficients (k=1..cutLow) to very
-//   small values (1..ampFloor). The decoder divides stored coefficients by these
-//   values — dividing by 1 instead of the original ~30 amplifies color deltas
-//   enormously → saturation explodes, color bleeds across block boundaries.
-//
-// The amplification depth is derived from the scene's exposure:
-//   darkness → cutLow   (how many low-freq coefficients get amplified)
-//   darkness → ampFloor (minimum quantization value — lower = more amplification)
+// ─── Glitch: amplificação de croma DQT ───────────────────────────────────────
+// Manipula só a tabela de crominância (ID=1): cores explodem sem afetar nitidez/luminância.
 void applyGlitchChroma(uint8_t* buf, size_t len) {
     float aecNorm  = (float)vfAecValue / 1200.0f;
     float gainNorm = (float)vfAgcGain  / 30.0f;
     float darkness = aecNorm * 0.4f + gainNorm * 0.6f;  // 0=bright, 1=dark
 
-    // Target mid-frequency chroma AC band (k=kMidLo..kMidHi).
-    // With quality=12 the encoder preserves more AC chroma values in this band,
-    // giving amplification real material → color variation within each block
-    // → smaller apparent patches than DC-only amplification.
-    // DC (k=0) also amplified at moderate level to keep bold color character
-    // without creating large solid-color 16×16 patches.
+    // amplifica faixa AC de croma média (k=kMidLo..kMidHi) + DC moderado
     int kMidLo = 4;
     int kMidHi = 18 + (int)(darkness * 10.0f);  // 18..28
     int dcVal  = 162 + (int)(darkness * 18.0f);  // 162..180  (-10%)
@@ -782,10 +719,7 @@ void applyGlitchChroma(uint8_t* buf, size_t len) {
     Serial.printf("[glitch] chroma dc=%d ac=%d kMid=%d..%d darkness=%.2f\n",
                   dcVal, acVal, kMidLo, kMidHi, darkness);
 
-    // ── Scan all DQT tables and apply amplification ───────────────────────
-    // Strategy: prefer chroma table (ID=1) if it exists; otherwise use all
-    // tables but skip only k=0 (DC) to preserve global brightness.
-    // Count tables first, then decide.
+    // varre tabelas DQT para identificar se existe tabela de croma (ID=1)
     bool hasChromaTable = false;
     int  tablesFound    = 0;
     int  i = 0;
@@ -807,8 +741,7 @@ void applyGlitchChroma(uint8_t* buf, size_t len) {
     }
     Serial.printf("[glitch] tables=%d hasChroma=%d\n", tablesFound, hasChromaTable);
 
-    // Amplify: if chroma table exists touch only ID=1; else touch everything
-    // (single-table OV2640 case) skipping only k=0 to keep global brightness.
+    // aplica só na tabela de crominância (ID=1) se existir, senão em todas
     i = 0;
     while (i < (int)len - 4) {
         if (buf[i] != 0xFF || buf[i + 1] != 0xDB) { i++; continue; }
@@ -830,7 +763,7 @@ void applyGlitchChroma(uint8_t* buf, size_t len) {
                     uint8_t newVal = 0;
                     if (k == 0)                        newVal = (uint8_t)dcVal;   // DC: moderate boost
                     else if (k >= kMidLo && k <= kMidHi) newVal = (uint8_t)acVal; // mid-freq AC: strong
-                    // all other k: leave original value (keeps them unchanged)
+                    // demais k: preserva valor original
 
                     if (newVal > 0) {
                         if (precision) {
@@ -850,32 +783,8 @@ void applyGlitchChroma(uint8_t* buf, size_t len) {
     }
 }
 
-// ─── Glitch: DQT zigzag permutation ──────────────────────────────────────────
-//
-// JPEG DQT tables store 64 quantization values in zigzag scan order:
-//   k=0       → DC coefficient (block average brightness)
-//   k=1..10   → low spatial frequencies (broad shapes, slow gradients)
-//   k=11..30  → mid frequencies (textures, contours)
-//   k=31..63  → high frequencies (fine edges, noise)
-//
-// At quality=12, values rise steeply from DC (~2) to high freq (~80+).
-// DC gets near-lossless precision; high freq is coarsely quantized.
-//
-// Effect: rotate the 63 AC values (k=1..63) by N positions (circular).
-//   - Values intended for low-freq slots go to mid/high-freq slots →
-//     low-freq DCT coefficients are now coarsely quantized → posterized
-//     blocks, stepped tonal gradients, loss of smooth areas.
-//   - Values intended for high-freq slots go to low-freq slots →
-//     high-freq DCT coefficients are finely quantized → edges and
-//     textures are over-preserved, amplified, ring/emboss-like.
-//
-// DC (k=0) is intentionally kept untouched — this preserves overall
-// block brightness and keeps the image recognizable no matter the rotation.
-//
-// Rotation amount driven by glitchFactor(): darker/higher-gain scenes
-// rotate further (more scrambling); bright scenes rotate less (subtle).
-//   gf ≈ 0.05 → rotation = 3   (mild frequency swap)
-//   gf ≈ 0.95 → rotation = 31  (half the array, maximum inversion)
+// ─── Glitch: permutação zigzag DQT ───────────────────────────────────────────
+// Rotaciona circularmente os 63 valores AC da tabela DQT: troca quant de freq baixa/alta → posterização + emboss.
 void applyGlitchZigzag(uint8_t* buf, size_t len) {
     float gf     = glitchFactor();
     int rotation = 4 + (int)(gf * 37.0f);  // 4..41  (-15% vs 5..49)
@@ -894,12 +803,12 @@ void applyGlitchZigzag(uint8_t* buf, size_t len) {
             pos++;
             if (pos + tableBytes > segEnd) break;
 
-            // Snapshot AC values k=1..63 before modifying
+            // copia AC antes de modificar
             uint8_t tmp[63];
             for (int k = 0; k < 63; k++)
                 tmp[k] = precision ? buf[pos + (k + 1) * 2 + 1] : buf[pos + k + 1];
 
-            // Write back with circular rotation: slot k gets value from slot (k+rotation)%63
+            // escreve de volta com rotação circular
             for (int k = 0; k < 63; k++) {
                 int src = (k + rotation) % 63;
                 if (precision) {
@@ -916,39 +825,8 @@ void applyGlitchZigzag(uint8_t* buf, size_t len) {
     }
 }
 
-// ─── Glitch: DHT run-length rotation ─────────────────────────────────────────
-//
-// AC Huffman symbols encode (run << 4) | size:
-//   run  = zero-run-length before this coefficient (high nibble, 0..15)
-//   size = magnitude category = extra bits to read from scan data (low nibble, 0..10)
-//
-// Rotating the full symbol array changes 'size' values → decoder reads wrong
-// number of extra bits → bit-offset shifts → Huffman de-sync → gray image.
-//
-// Safe strategy: rotate only WITHIN each size group (same low nibble).
-// Symbols with size=N consume exactly N extra bits regardless of run value,
-// so swapping run values inside the group never shifts the bit position.
-// The scan data stays perfectly in sync; only the zero-run-length before each
-// coefficient is interpreted wrongly → coefficients land in wrong positions
-// within the 8×8 DCT block → spatial frequency mis-registration:
-//   - Texture coefficients appear in smooth-area positions → noise in flat zones
-//   - Edge coefficients displaced → ringing artifacts in wrong places
-//   - Overall: structured distortion that varies by block content
-//
-// DC tables are skipped: DC symbols ARE the size category, so any rotation
-// would change bit consumption and de-sync the stream.
-//
-// Refinement: SIZE-SCALED ROTATION
-//   rotation for group sz = (base * sz) / 5
-//   sz=1 (small magnitude, common) → less rotation → flat areas preserved
-//   sz=10 (large magnitude, strong edges) → more rotation → distortion on high-contrast zones
-//
-// Alternating direction (even/odd sz) was attempted but creates near-reversals
-// in small groups (gn=3, backward=2 → 2/3 rotation → chroma explosion). Dropped.
-//
-// Two base rotations driven by glitchFactor():
-//   rotLuma   (tableId=0): 1..6
-//   rotChroma (tableId=1): rotLuma-1, capped 1..3 — chroma table smaller, more sensitive
+// ─── Glitch: rotação de run-length DHT ───────────────────────────────────────
+// Rotaciona símbolos AC Huffman dentro de cada grupo de magnitude: desloca coeficientes DCT → distorção estrutural.
 void applyGlitchDHT(uint8_t* buf, size_t len) {
     float gf        = glitchFactor();
     int   rotLuma   = constrain(1 + (int)(gf * 5.0f), 1, 6);
@@ -972,7 +850,7 @@ void applyGlitchDHT(uint8_t* buf, size_t len) {
                 nSymbols += buf[pos + k];
             pos += 16;
 
-            // AC tables only — DC symbol values equal size, rotation would de-sync
+            // só tabelas AC — DC causaria dessincronização do stream
             if (tableClass == 1 && nSymbols > 1 && pos + nSymbols <= segEnd) {
                 int      rotation = (tableId == 0) ? rotLuma : rotChroma;
                 uint8_t* syms     = buf + pos;
@@ -989,7 +867,7 @@ void applyGlitchDHT(uint8_t* buf, size_t len) {
                     }
                     if (gn < 2) continue;
 
-                    // Scale rotation by size: high-freq bands (sz grande) giram mais
+                    // rotação escalada por magnitude: freq alta gira mais
                     int scaledRot = constrain((rotation * sz) / 5, 1, gn - 1);
 
                     for (int k = 0; k < gn; k++)
@@ -1068,7 +946,7 @@ void showPreview(uint8_t* buf, size_t len, const char* filename) {
     vfNeedsClear = true;
 }
 
-// ─── Long exposure: frame stacking ──────────────────────────────────────────
+// ─── Long exposure: stacking de frames ──────────────────────────────────────
 // Captura JPEG QVGA e usa JPEGDEC para decodificar cada frame.
 // JPEGDEC já funciona corretamente no preview TFT (RGB565_LITTLE_ENDIAN
 // confirmado), então os canais R/G/B têm ordem garantida sem ambiguidade.
@@ -1143,7 +1021,7 @@ void takeLongExposureStacked() {
 
     g_leR = accR; g_leG = accG; g_leB = accB; g_leW = W;
 
-    // Usa _jpeg (static, em BSS) — JPEGDEC local causaria stack overflow
+    // usa _jpeg (static) — instância local causaria stack overflow
     int frameCount = 0;
     unsigned long t0      = millis();
     unsigned long totalMs = (unsigned long)leSeconds * 1000UL;
@@ -1157,7 +1035,7 @@ void takeLongExposureStacked() {
         if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
             if (_jpeg.openRAM(fb->buf, (int)fb->len, leStackCallback)) {
                 _jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-                _jpeg.decode(0, 0, 0);   // resolução completa, sem escala
+                _jpeg.decode(0, 0, 0);   // sem escala — resolução completa
                 _jpeg.close();
                 frameCount++;
             }
@@ -1204,7 +1082,7 @@ void takeLongExposureStacked() {
             float r = accR[i] * invR;
             float g = accG[i] * invG;
             float b = accB[i] * invR;
-            // fmt2jpg(PIXFORMAT_RGB888) interpreta o buffer como BGR888
+            // fmt2jpg espera BGR888 — inverte R e B
             rgb[i * 3    ] = b > 255.0f ? 255 : (uint8_t)b;
             rgb[i * 3 + 1] = g > 255.0f ? 255 : (uint8_t)g;
             rgb[i * 3 + 2] = r > 255.0f ? 255 : (uint8_t)r;
@@ -1271,7 +1149,7 @@ void takeLongExposureStacked() {
 void takePhoto() {
     if (leSeconds > 0) { takeLongExposureStacked(); return; }
 
-    // shutter flash
+    // flash de obturador
     tft.fillScreen(gbPalette[3]); delay(25);
     tft.fillScreen(gbPalette[1]); delay(20);
     tft.fillScreen(gbPalette[0]);
@@ -1279,7 +1157,7 @@ void takePhoto() {
     const char* captureLabel = "CAPTURING...";
     drawCaptureStatus(captureLabel, 5);
 
-    // ── Captura JPEG (pipeline único para todos os efeitos) ─────────────────
+    // captura JPEG
     if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, 1)) {
         tft.fillScreen(ST77XX_BLACK);
         tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
@@ -1318,7 +1196,7 @@ void takePhoto() {
     }
     esp_camera_fb_return(fb); fb = nullptr;
 
-    // ── JPEG FX: databending em photoBuf ───────────────────────────────────
+    // JPEG FX: databending em photoBuf
     if (photoBuf && (fxDQT || fxScan || fxChroma || fxZigzag || fxDHT)) {
         drawCaptureStatus("GLITCHING...", 90);
         if (fxZigzag) applyGlitchZigzag(photoBuf, photoLen);
@@ -1328,7 +1206,7 @@ void takePhoto() {
         if (fxChroma) applyGlitchChroma(photoBuf, photoLen);
     }
 
-    // reconnect STA se necessário (não aplica em AP mode)
+    // reconecta STA se necessário (não aplica em modo AP)
     if (!wifiAP) {
         if (!wifiOK && WiFi.status() == WL_CONNECTED) { wifiOK = true; setupWebServer(); }
         if (!wifiOK) {
@@ -1341,12 +1219,12 @@ void takePhoto() {
     char filename[32] = "";
     bool savedSD = saveToSD(photoBuf, photoLen, filename);
 
-    // reinicia câmera para viewfinder
+    // reinicia câmera no modo viewfinder
     initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
 
     drawCaptureStatus("DONE!", 100);
 
-    // preview da foto no TFT
+    // exibe preview no TFT
     if (photoBuf) {
         char label[36];
         if (savedSD) snprintf(label, sizeof(label), "%s", filename + 1);
@@ -1357,7 +1235,7 @@ void takePhoto() {
     }
 }
 
-// ─── Web handlers ─────────────────────────────────────────────────────────────
+// ─── Handlers web ─────────────────────────────────────────────────────────────
 
 void handleEditor() {
     String file = server.arg("file");
@@ -1368,7 +1246,7 @@ void handleEditor() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
 
-    // ── HEAD + CSS ──────────────────────────────────────────────────────────
+    // cabeçalho + CSS
     server.sendContent(
         "<!DOCTYPE html><html><head>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1408,6 +1286,8 @@ void handleEditor() {
         ".pxs button.on{background:#f0f;color:#000}"
         ".ebt button{color:#0ff;border-color:#0ff}"
         ".ebt button.on{background:#0ff;color:#000}"
+        ".asc button{color:#f55;border-color:#f55}"
+        ".asc button.on{background:#f55;color:#000}"
         ".crp button{color:#fa0;border-color:#fa0;min-width:44px}"
         ".crp button.on{background:#fa0;color:#000}"
         "#bSave{border-color:#ff0;color:#ff0;flex:2}"
@@ -1416,7 +1296,7 @@ void handleEditor() {
         "</style></head><body>"
     );
 
-    // ── TOP BAR ─────────────────────────────────────────────────────────────
+    // barra superior
     server.sendContent(
         "<div class='topbar'>"
         "<a href='/galeria'>&#8592; gallery</a>"
@@ -1425,7 +1305,7 @@ void handleEditor() {
     );
     server.sendContent(String("<div class='fn'>") + (file.length() ? file : "last photo (RAM)") + "</div>");
 
-    // ── CANVAS + CONTROLES ──────────────────────────────────────────────────
+    // canvas + controles
     server.sendContent(
         "<div class='editor-layout'>"
         "<div class='canvas-panel'>"
@@ -1499,6 +1379,24 @@ void handleEditor() {
         "<span class='val' id='vELvl'>4</span></div>"
         "<div class='btns ebt'><button id='bEight'>&#9632; 8bit: off</button></div>"
 
+        "<div class='sec'>ascii art</div>"
+        "<div class='btns asc'>"
+        "<button id='bAcCs0' class='on'>.@#</button>"
+        "<button id='bAcCs1'>&#9617;&#9618;&#9619;</button>"
+        "<button id='bAcCs2'>01</button>"
+        "<button id='bAcCs3'>&#9616;&#9600;&#9622;</button>"
+        "</div>"
+        "<div class='row'><label>tamanho</label>"
+        "<input type='range' id='sAcSz' min='4' max='20' value='8' step='2'>"
+        "<span class='val' id='vAcSz'>8</span></div>"
+        "<div class='btns asc'>"
+        "<button id='bAcCmono' class='on'>mono</button>"
+        "<button id='bAcCcolor'>color</button>"
+        "<button id='bAcCgreen'>green</button>"
+        "<button id='bAcCamber'>amber</button>"
+        "</div>"
+        "<div class='btns asc'><button id='bAscii'>Aa ascii: off</button></div>"
+
         "<div class='divider'></div>"
         "<div class='btns'>"
         "<button id='bReset'>reset</button>"
@@ -1506,11 +1404,11 @@ void handleEditor() {
         "</div></div></div>"
     );
 
-    // ── JS: carregamento da imagem ───────────────────────────────────────────
+    // JS: carregamento da imagem
     server.sendContent(String(
         "<script>"
         "const c=document.getElementById('c'),ctx=c.getContext('2d');"
-        "let orig=null,origW=0,origH=0,rot=0,flipH=false,filt=null,eightOn=false,cropRatio=null;"
+        "let orig=null,origW=0,origH=0,rot=0,flipH=false,filt=null,eightOn=false,cropRatio=null,asciiOn=false,asciiCs=0,asciiCol='mono';"
         "const img=new Image();"
         "img.crossOrigin='anonymous';"
         "img.onload=()=>{"
@@ -1526,12 +1424,12 @@ void handleEditor() {
         "img.src='") + src + "';"
     );
 
-    // ── JS: render() ────────────────────────────────────────────────────────
+    // JS: render()
     server.sendContent(
         "function clamp(v){return Math.max(0,Math.min(255,v))}"
         "function render(){"
           "if(!orig)return;"
-          // pixel ops (bri/con/sat/filter)
+          // ajustes de pixel (bri/con/sat/filtro)
           "const d=new ImageData(new Uint8ClampedArray(orig.data),origW,origH);"
           "const px=d.data;"
           "const br=+document.getElementById('sBri').value;"
@@ -1560,7 +1458,7 @@ void handleEditor() {
             "else if(filt==='noir'){const nl=0.299*r+0.587*g+0.114*b;r=g=b=(nl-128)*1.5+128;}"
             "px[i]=clamp(r);px[i+1]=clamp(g);px[i+2]=clamp(b);"
           "}"
-          // rotation + flip
+          // rotação + flip
           "const ptmp=document.createElement('canvas');"
           "ptmp.width=origW;ptmp.height=origH;"
           "ptmp.getContext('2d').putImageData(d,0,0);"
@@ -1569,14 +1467,14 @@ void handleEditor() {
           "ctx.save();ctx.translate(c.width/2,c.height/2);ctx.rotate(rot*Math.PI/2);"
           "if(flipH)ctx.scale(-1,1);"
           "ctx.drawImage(ptmp,-origW/2,-origH/2);ctx.restore();"
-          // vignette
+          // vignete
           "const vig=+document.getElementById('sVig').value;"
           "if(vig>0){"
             "const vg=ctx.createRadialGradient(c.width/2,c.height/2,Math.min(c.width,c.height)*0.25,c.width/2,c.height/2,Math.max(c.width,c.height)*0.75);"
             "vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(0,0,0,'+vig/100+')');"
             "ctx.fillStyle=vg;ctx.fillRect(0,0,c.width,c.height);"
           "}"
-          // chromatic aberration
+          // aberração cromática
           "const ca=+document.getElementById('sCA').value;"
           "if(ca>0){"
             "const caid=ctx.getImageData(0,0,c.width,c.height);"
@@ -1590,7 +1488,7 @@ void handleEditor() {
             "}}"
             "ctx.putImageData(caid,0,0);"
           "}"
-          // pixel sort
+          // ordenação de pixels
           "if(psOn){"
             "const psid=ctx.getImageData(0,0,c.width,c.height);"
             "const pspx=psid.data;"
@@ -1622,7 +1520,7 @@ void handleEditor() {
                 "else if(ss!==-1)fl(pos);}}"
             "ctx.putImageData(psid,0,0);"
           "}"
-          // 8-bit: pixelation + color quantization
+          // 8-bit: pixelação + quantização de cor
           "if(eightOn){"
             "const EW=c.width,EH=c.height;"
             "const bsz=+document.getElementById('sEBsz').value;"
@@ -1642,7 +1540,34 @@ void handleEditor() {
                 "const i=(y*EW+x)*4;epx[i]=qr;epx[i+1]=qg;epx[i+2]=qb;}}}}"
             "ctx.putImageData(eid,0,0);"
           "}"
-          // crop overlay com grade de terços
+          // converte canvas em ascii art
+          "if(asciiOn){"
+            "const AW=c.width,AH=c.height;"
+            "const src=ctx.getImageData(0,0,AW,AH),spx=src.data;"
+            "const out=document.createElement('canvas');"
+            "out.width=AW;out.height=AH;"
+            "const octx=out.getContext('2d');"
+            "octx.fillStyle='#000';octx.fillRect(0,0,AW,AH);"
+            "const csz=+document.getElementById('sAcSz').value;"
+            "octx.font='bold '+csz+'px monospace';octx.textBaseline='top';"
+            "const charsets=[' .:-=+*#@%',' \\u2591\\u2592\\u2593\\u2588',' 01',' \\u2596\\u258c\\u259b\\u2588'];"
+            "const charset=charsets[asciiCs],clen=charset.length;"
+            "for(let y=0;y<AH;y+=csz){for(let x=0;x<AW;x+=csz){"
+              "let r=0,g=0,b=0,cnt=0;"
+              "const x2=Math.min(x+csz,AW),y2=Math.min(y+csz,AH);"
+              "for(let py=y;py<y2;py++){for(let px=x;px<x2;px++){"
+                "const i=(py*AW+px)*4;r+=spx[i];g+=spx[i+1];b+=spx[i+2];cnt++;}}"
+              "r/=cnt;g/=cnt;b/=cnt;"
+              "const luma=0.299*r+0.587*g+0.114*b;"
+              "const ch=charset[Math.min(clen-1,Math.floor(luma/255*clen))];"
+              "if(asciiCol==='color'){octx.fillStyle='rgb('+Math.round(r)+','+Math.round(g)+','+Math.round(b)+')';}"
+              "else if(asciiCol==='green'){const v=Math.round(luma*0.7+55);octx.fillStyle='rgb(0,'+v+',0)';}"
+              "else if(asciiCol==='amber'){const v=Math.round(luma*0.7+55);octx.fillStyle='rgb('+v+','+Math.round(v*0.45)+',0)';}"
+              "else{const v=Math.round(luma);octx.fillStyle='rgb('+v+','+v+','+v+')';}"
+              "if(ch.trim())octx.fillText(ch,x,y);}}"
+            "ctx.drawImage(out,0,0);"
+          "}"
+          // overlay de crop com grade de terços
           "if(cropRatio){"
             "const CW=c.width,CH=c.height,rw=cropRatio.w,rh=cropRatio.h;"
             "let cw,ch;"
@@ -1665,7 +1590,7 @@ void handleEditor() {
         "}"
     );
 
-    // ── JS: wiring e handlers ────────────────────────────────────────────────
+    // JS: eventos e handlers
     server.sendContent(
         "function wire(s,v){const e=document.getElementById(s);"
           "e.addEventListener('input',()=>{document.getElementById(v).textContent=e.value;render();});}"
@@ -1674,9 +1599,10 @@ void handleEditor() {
         "wire('sVig','vVig');wire('sCA','vCA');"
         "wire('sPsMin','vPsMin');wire('sPsMax','vPsMax');"
         "wire('sEBsz','vEBsz');wire('sELvl','vELvl');"
+        "wire('sAcSz','vAcSz');"
         "wire('sCrSc','vCrSc');wire('sCrX','vCrX');wire('sCrY','vCrY');"
 
-        // pixel sort state + handlers
+        // estado e handlers do pixel sort
         "let psOn=false,psDir='h',psKey='luma';"
         "function setPsDir(d){"
           "psDir=d;"
@@ -1715,6 +1641,31 @@ void handleEditor() {
         "document.getElementById('bRotR').onclick=()=>{rot=(rot+1)%4;render();};"
         "document.getElementById('bFlip').onclick=()=>{"
           "flipH=!flipH;document.getElementById('bFlip').classList.toggle('on',flipH);render();};"
+
+        "function setAsciiCs(i){"
+          "asciiCs=i;"
+          "['bAcCs0','bAcCs1','bAcCs2','bAcCs3'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "document.getElementById('bAcCs'+i).classList.add('on');"
+          "if(asciiOn)render();}"
+        "function setAsciiCol(col){"
+          "asciiCol=col;"
+          "['bAcCmono','bAcCcolor','bAcCgreen','bAcCamber'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "document.getElementById('bAcC'+col).classList.add('on');"
+          "if(asciiOn)render();}"
+        "document.getElementById('bAcCs0').onclick=()=>setAsciiCs(0);"
+        "document.getElementById('bAcCs1').onclick=()=>setAsciiCs(1);"
+        "document.getElementById('bAcCs2').onclick=()=>setAsciiCs(2);"
+        "document.getElementById('bAcCs3').onclick=()=>setAsciiCs(3);"
+        "document.getElementById('bAcCmono').onclick=()=>setAsciiCol('mono');"
+        "document.getElementById('bAcCcolor').onclick=()=>setAsciiCol('color');"
+        "document.getElementById('bAcCgreen').onclick=()=>setAsciiCol('green');"
+        "document.getElementById('bAcCamber').onclick=()=>setAsciiCol('amber');"
+        "document.getElementById('bAscii').onclick=()=>{"
+          "asciiOn=!asciiOn;"
+          "const b=document.getElementById('bAscii');"
+          "b.classList.toggle('on',asciiOn);"
+          "b.innerHTML=asciiOn?'Aa ascii: on':'Aa ascii: off';"
+          "render();};"
 
         "document.getElementById('bEight').onclick=()=>{"
           "eightOn=!eightOn;"
@@ -1762,7 +1713,7 @@ void handleEditor() {
           "['vBri','vCon','vSat','vSha','vHil','vTemp','vFade','vVig','vCA'].forEach(v=>document.getElementById(v).textContent=0);"
           "['sPsMin','sPsMax'].forEach(s=>document.getElementById(s).value=s==='sPsMin'?20:80);"
           "document.getElementById('vPsMin').textContent=20;document.getElementById('vPsMax').textContent=80;"
-          "filt=null;rot=0;flipH=false;psOn=false;psDir='h';psKey='luma';eightOn=false;cropRatio=null;"
+          "filt=null;rot=0;flipH=false;psOn=false;psDir='h';psKey='luma';eightOn=false;cropRatio=null;asciiOn=false;asciiCs=0;asciiCol='mono';"
           "document.getElementById('bFlip').classList.remove('on');"
           "['bGray','bSepia','bInvert','bNoir'].forEach(id=>document.getElementById(id).classList.remove('on'));"
           "setRatio('bCrOrig',null);"
@@ -1775,6 +1726,10 @@ void handleEditor() {
           "document.getElementById('bEight').innerHTML='&#9632; 8bit: off';"
           "document.getElementById('sEBsz').value=8;document.getElementById('vEBsz').textContent=8;"
           "document.getElementById('sELvl').value=4;document.getElementById('vELvl').textContent=4;"
+          "document.getElementById('bAscii').classList.remove('on');"
+          "document.getElementById('bAscii').innerHTML='Aa ascii: off';"
+          "document.getElementById('sAcSz').value=8;document.getElementById('vAcSz').textContent=8;"
+          "setAsciiCs(0);setAsciiCol('mono');"
           "document.getElementById('bPsH').classList.add('on');"
           "document.getElementById('bPsV').classList.remove('on');"
           "document.getElementById('bPsLuma').classList.add('on');"
@@ -1862,7 +1817,7 @@ void handleGallery() {
         "</style></head><body>"
     );
 
-    // header
+    // cabeçalho da galeria
     char hdr[60];
     snprintf(hdr, sizeof(hdr), "<h2>GALLERY</h2><div class='info'>%d photos on SD</div>", (int)files.size());
     server.sendContent(hdr);
@@ -1935,7 +1890,7 @@ void handleSDFile() {
     f.close();
 }
 
-// ─── Boot intro ──────────────────────────────────────────────────────────────
+// ─── Introdução de boot ──────────────────────────────────────────────────────
 
 static void typePrint(const char* s, int x, int y, uint8_t sz, uint16_t col, int ms) {
     tft.setTextSize(sz);
@@ -1947,13 +1902,8 @@ static void typePrint(const char* s, int x, int y, uint8_t sz, uint16_t col, int
     }
 }
 
-// Layout CBLNDR: textSize 6 (36×48px/char), 3 chars por linha, centrado
-//   Linha 1 — CBL: x=26, y=4   (3×36=108px, margem 26px cada lado)
-//   Linha 2 — NDR: x=26, y=56  (gap 4px após y=52)
-//   Handles :      y=111 / y=119  (após separador em y=106)
-//
-// Scramble por coluna: C+N travam juntos, depois B+D, depois L+R
-//   → 3 pulsos de LED, colunas "solidificando" da esquerda pra direita
+// Intro com scramble animado do logo CBLNDR (2 linhas × 3 chars, textSize=6).
+// Colunas travam em pares: C+N → B+D → L+R, com pulso de LED em cada travamento.
 
 static void bootIntro() {
     const uint16_t gc = 0x07E0;   // verde brilhante (scramble / cantos)
@@ -1961,7 +1911,7 @@ static void bootIntro() {
 
     tft.fillScreen(ST77XX_BLACK);
 
-    // ── cantos viewfinder crescem antes do scramble ───────────────────────────
+    // cantos do viewfinder crescem antes do scramble
     for (int m = 1; m <= 10; m++) {
         tft.drawPixel(m - 1,   0,       gc);
         tft.drawPixel(0,       m - 1,   gc);
@@ -1975,9 +1925,7 @@ static void bootIntro() {
     }
     delay(80);
 
-    // ── scramble CBLNDR ───────────────────────────────────────────────────────
-    // Linha 1 — CBL (y=4)  |  Linha 2 — NDR (y=56)
-    // Colunas travam em par: C+N (step 0), B+D (step 4), L+R (step 8)
+    // scramble CBLNDR: par C+N (step 0), B+D (step 4), L+R (step 8)
     const char*  target = "CBLNDR";
     const int8_t px[6]  = { 26, 62, 98, 26, 62, 98 };
     const int8_t py[6]  = {  4,  4,  4, 56, 56, 56 };
@@ -1985,7 +1933,7 @@ static void bootIntro() {
     tft.setTextSize(6);
     for (int step = 0; step < 15; step++) {
         bool flash = false;
-        // ~25% de chance de re-scramble em char já travado → instabilidade
+        // ~25% de chance de re-scramble em char travado → instabilidade visual
         int reglitch = (step >= 4 && random(4) == 0) ? random(6) : -1;
 
         for (int i = 0; i < 6; i++) {
@@ -2008,7 +1956,7 @@ static void bootIntro() {
         if (flash) digitalWrite(LED_FLASH, LOW);
     }
 
-    // ── glitch agressivo: 9 bursts de 1-3 chars simultâneos ──────────────────
+    // glitch agressivo: 9 bursts de 1–3 chars simultâneos
     for (int g = 0; g < 9; g++) {
         int n = 1 + random(3);
         int pos[3] = { random(6), random(6), random(6) };
@@ -2036,7 +1984,7 @@ static void bootIntro() {
         delay(28 + random(38));
     }
 
-    // finale: tudo scramble de uma vez → trava coluna por coluna com LED
+    // finale: scramble total → trava coluna por coluna com LED
     tft.setTextSize(6);
     for (int i = 0; i < 6; i++) {
         tft.fillRect(px[i], py[i], 36, 48, ST77XX_BLACK);
@@ -2056,21 +2004,19 @@ static void bootIntro() {
     }
     delay(140);
 
-    // ── separador e handles ───────────────────────────────────────────────────
+    // separador e handles de autoria
     for (int x = 26; x <= 134; x += 4) {
         tft.drawFastHLine(26, 106, x - 26, gd);
         delay(6);
     }
 
-    // @cebolander: 11 chars × 6px = 66px → x=(160-66)/2 = 47
     typePrint("@cebolander",    47, 111, 1, ST77XX_WHITE, 32);
-    // @lixofuturista: 14 chars × 6px = 84px → x=(160-84)/2 = 38
     typePrint("@lixofuturista", 38, 119, 1, ST77XX_WHITE, 22);
 
     delay(2000);
 }
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+// ─── Inicialização ───────────────────────────────────────────────────────────
 
 void setup() {
     Serial.begin(115200);
@@ -2090,7 +2036,7 @@ void setup() {
     // ── Fases 1 e 2 ──────────────────────────────────────────────────────────
     bootIntro();
 
-    // ── Fase 3 — CYBERSHOT DIY + system checks ───────────────────────────────
+    // ── Fase 3 — CYBERSHOT DIY + verificação dos sistemas ───────────────────
     tft.fillScreen(ST77XX_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(0x07E0);
@@ -2138,13 +2084,13 @@ void setup() {
     tft.setTextColor(ST77XX_GREEN);
     tft.setCursor(8, 38); tft.print("CAM  OK");
 
-    // WiFi (desenha em y=50)
+    // WiFi
     setupWiFi();
     delay(800);
     tft.fillScreen(ST77XX_BLACK);
 }
 
-// ─── Menu ────────────────────────────────────────────────────────────────────
+// ─── Menu principal ──────────────────────────────────────────────────────────
 
 // Countdown do timer: pisca LED em ritmo crescente, exibe contagem no TFT.
 void runCountdown() {
@@ -2318,7 +2264,7 @@ void drawMenu() {
     tft.print("-- MENU --");
     tft.drawFastHLine(0, 15, 160, 0x0260);
 
-    // 7 itens: y = 17 + i*15, height=12 → último termina em 122, hint em 120 (sobrepõe ok)
+    // 7 itens: y = 17 + i*15, h=12; hint em 120 sobrepõe o último (ok)
     for (int i = 0; i < MENU_N; i++) {
         int iy = 17 + i * 15;
         if (i == menuSel) {
@@ -2489,7 +2435,7 @@ void drawVfColorSelect() {
     tft.print("[JOY]=sel  [BTN]=OK");
 }
 
-// ─── Botão ───────────────────────────────────────────────────────────────────
+// ─── Leitura do botão ────────────────────────────────────────────────────────
 
 void handleButton() {
     static bool          lastBtn     = HIGH;
@@ -2690,12 +2636,12 @@ void handleVfInput() {
     evComp = newEv;
     lastMove = millis();
 
-    // Aplica imediatamente ao sensor usando a DIREÇÃO (delta), não o valor absoluto
+    // aplica ao sensor pela direção (delta), não pelo valor absoluto
     sensor_t* s = esp_camera_sensor_get();
     if (!s) return;
     if (delta > 0) {
         vfAecValue = min(1200, vfAecValue * 2);
-        if (vfAecValue >= 1200) vfAgcGain = min(30, vfAgcGain + 5);  // ~1 stop de ganho
+        if (vfAecValue >= 1200) vfAgcGain = min(30, vfAgcGain + 5);  // ~1 stop extra
     } else {
         if (vfAgcGain >= 5) vfAgcGain = max(0,  vfAgcGain - 5);
         else { vfAgcGain = 0; vfAecValue = max(50, vfAecValue / 2); }
@@ -2704,7 +2650,7 @@ void handleVfInput() {
     s->set_agc_gain(s, vfAgcGain);
 }
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
+// ─── Loop principal ──────────────────────────────────────────────────────────
 
 void loop() {
     if (!wifiAP && !wifiOK && WiFi.status() == WL_CONNECTED) {
