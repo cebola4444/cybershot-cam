@@ -272,7 +272,7 @@ STEPS = [
     ("01", "Instale o PlatformIO",
            "Extensão para VS Code ou CLI — https://platformio.org"),
     ("02", "Clone o repositório",
-           "git clone https://github.com/seu-usuario/cybershot-cam"),
+           "git clone https://github.com/cebola4444/cybershot-cam"),
     ("03", "Abra no VS Code",
            "Abra a pasta do projeto com a extensão do PlatformIO ativa"),
     ("04", "Conecte a placa",
@@ -449,7 +449,7 @@ story.append(rule(ACCENT, 1, 0, 6))
 story.append(p(
     "DIY - CYBERSHOT  //  projeto open source  //  "
     "feito com PlatformIO + esp32-camera  //  "
-    "github.com/seu-usuario/cybershot-cam", sSmall))
+    "github.com/cebola4444/cybershot-cam", sSmall))
 
 # ── build ────────────────────────────────────────────────────────────────────
 doc = SimpleDocTemplate(
