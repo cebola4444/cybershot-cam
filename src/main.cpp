@@ -18,8 +18,6 @@
  */
 
 #include <Arduino.h>
-#include <algorithm>
-#include <vector>
 #include <JPEGDEC.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -359,6 +357,8 @@ void handleGallery();
 void handleEditor();
 void handleDelete();
 void handleSDFile();
+void handleSaveEdit();
+void handleSaveEditUpload();
 
 void setupWebServer();   // forward declaration
 
@@ -537,12 +537,13 @@ void startWiFiPortal() {
 // ─── Web server (modo câmera normal) ─────────────────────────────────────────
 
 void setupWebServer() {
-    MDNS.begin("cybershot");
-    server.on("/",        handleRoot);
-    server.on("/foto",    handleFoto);
-    server.on("/galeria", handleGallery);
-    server.on("/editor",  handleEditor);
-    server.on("/delete",  handleDelete);
+    if (!wifiAP) MDNS.begin("cybershot");  // mDNS só em STA; em AP consome heap sem uso
+    server.on("/",          handleRoot);
+    server.on("/foto",      handleFoto);
+    server.on("/galeria",   handleGallery);
+    server.on("/editor",    handleEditor);
+    server.on("/delete",    handleDelete);
+    server.on("/save-edit", HTTP_POST, handleSaveEdit, handleSaveEditUpload);
     server.onNotFound(handleSDFile);
     server.begin();
     IPAddress ip = wifiAP ? WiFi.softAPIP() : WiFi.localIP();
@@ -1238,6 +1239,10 @@ void takePhoto() {
 // ─── Handlers web ─────────────────────────────────────────────────────────────
 
 void handleEditor() {
+    if (esp_get_free_heap_size() < 18000) {
+        server.send(503, "text/plain", "low memory - try again");
+        return;
+    }
     String file = server.arg("file");
     String ram  = server.arg("ram");
     String src  = ram.length() ? "/foto" : ("/sd/" + file);
@@ -1303,7 +1308,12 @@ void handleEditor() {
         "<h2>EDITOR</h2><span></span>"
         "</div>"
     );
-    server.sendContent(String("<div class='fn'>") + (file.length() ? file : "last photo (RAM)") + "</div>");
+    {
+        char fnBuf[72];
+        snprintf(fnBuf, sizeof(fnBuf), "<div class='fn'>%s</div>",
+                 file.length() ? file.c_str() : "last photo (RAM)");
+        server.sendContent(fnBuf, strlen(fnBuf));
+    }
 
     // canvas + controles
     server.sendContent(
@@ -1405,7 +1415,7 @@ void handleEditor() {
     );
 
     // JS: carregamento da imagem
-    server.sendContent(String(
+    {static const char _s[] =
         "<script>"
         "const c=document.getElementById('c'),ctx=c.getContext('2d');"
         "let orig=null,origW=0,origH=0,rot=0,flipH=false,filt=null,eightOn=false,cropRatio=null,asciiOn=false,asciiCs=0,asciiCol='mono';"
@@ -1421,8 +1431,10 @@ void handleEditor() {
           "render();"
         "};"
         "img.onerror=()=>document.getElementById('status').textContent='erro ao carregar';"
-        "img.src='") + src + "';"
-    );
+        "img.src='";
+    server.sendContent(_s, sizeof(_s)-1);}
+    server.sendContent(src);
+    server.sendContent("';", 2);
 
     // JS: render()
     server.sendContent(
@@ -1737,21 +1749,60 @@ void handleEditor() {
           "render();};"
     );
 
-    server.sendContent(String(
+    {static const char _s[] =
         "document.getElementById('bSave').onclick=()=>{"
           "const b=document.getElementById('bSave');"
-          "b.classList.add('on');b.textContent='saving...';"
-          "setTimeout(()=>{"
-            "const a=document.createElement('a');"
-            "a.download='") + dlname + "';"
-            "a.href=c.toDataURL('image/jpeg',0.92);a.click();"
-            "b.classList.remove('on');b.textContent='\\u2195 save';"
-          "},50);};"
-        "</script></body></html>"
-    );
+          "b.classList.add('on');b.textContent='uploading...';"
+          "c.toBlob(blob=>{"
+            "const fd=new FormData();"
+            "fd.append('f',blob,'edit.jpg');"
+            "fetch('/save-edit',{method:'POST',body:fd})"
+            ".then(r=>r.ok?r.text():Promise.reject())"
+            ".then(fname=>{"
+              "const a=document.createElement('a');"
+              "a.href='/sd/'+fname;a.download=fname;"
+              "document.body.appendChild(a);a.click();document.body.removeChild(a);"
+            "})"
+            ".catch(()=>alert('save error'))"
+            ".finally(()=>{b.classList.remove('on');b.textContent='\\u2195 save';});"
+          "},'image/jpeg',0.92);};"
+        "</script></body></html>";
+    server.sendContent(_s, sizeof(_s)-1);}
 }
 
+// ─── Upload de imagem editada → salva no SD e serve como download ────────────
+
+static File editUpFile;
+static char editSavedName[32] = "";
+
+void handleSaveEditUpload() {
+    if (!sdOK) return;
+    HTTPUpload& up = server.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        photoCount++;
+        snprintf(editSavedName, sizeof(editSavedName), "EDIT_%04d.JPG", photoCount);
+        char path[36];
+        snprintf(path, sizeof(path), "/%s", editSavedName);
+        editUpFile = SD_MMC.open(path, FILE_WRITE);
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (editUpFile) editUpFile.write(up.buf, up.currentSize);
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (editUpFile) editUpFile.close();
+    }
+}
+
+void handleSaveEdit() {
+    if (!sdOK || editSavedName[0] == '\0') {
+        server.send(500, "text/plain", "no sd");
+        return;
+    }
+    server.send(200, "text/plain", editSavedName);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 void handleRoot() {
+    if (wifiSetup) { handleSetupPage(); return; }  // portal ativo: delega pro setup
     String html =
         "<html><head><meta name='viewport' content='width=device-width'>"
         "<style>body{background:#000;color:#0f0;font-family:monospace;text-align:center}"
@@ -1772,18 +1823,38 @@ void handleFoto() {
 }
 
 void handleGallery() {
-    // Coleta e ordena arquivos mais recente primeiro
-    std::vector<String> files;
+    if (esp_get_free_heap_size() < 18000) {
+        server.send(503, "text/plain", "low memory - try again");
+        return;
+    }
+    // Array estático: sem heap, sem vector, sem std::bad_alloc
+    // 512 * 32 = 16KB em BSS — não afeta heap
+    static char fileNames[512][32];
+    int fileCount = 0;
+
     if (sdOK) {
         File root = SD_MMC.open("/");
         File f = root.openNextFile();
-        while (f) {
-            String name = f.name();
-            if (name.endsWith(".JPG") || name.endsWith(".jpg"))
-                files.push_back(name);
+        while (f && fileCount < 512) {
+            const char* n = f.name();
+            int len = strlen(n);
+            if (len > 4 && (strcasecmp(n + len - 4, ".JPG") == 0)) {
+                strncpy(fileNames[fileCount], n, 31);
+                fileNames[fileCount][31] = '\0';
+                fileCount++;
+            }
             f = root.openNextFile();
         }
-        std::sort(files.begin(), files.end(), [](const String& a, const String& b){ return a > b; });
+        root.close();
+        // ordena decrescente (mais recente primeiro) sem alocação dinâmica
+        for (int i = 0; i < fileCount - 1; i++)
+            for (int j = i + 1; j < fileCount; j++)
+                if (strcmp(fileNames[i], fileNames[j]) < 0) {
+                    char tmp[32];
+                    memcpy(tmp, fileNames[i], 32);
+                    memcpy(fileNames[i], fileNames[j], 32);
+                    memcpy(fileNames[j], tmp, 32);
+                }
     }
 
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -1819,7 +1890,7 @@ void handleGallery() {
 
     // cabeçalho da galeria
     char hdr[60];
-    snprintf(hdr, sizeof(hdr), "<h2>GALLERY</h2><div class='info'>%d photos on SD</div>", (int)files.size());
+    snprintf(hdr, sizeof(hdr), "<h2>GALLERY</h2><div class='info'>%d photos on SD</div>", fileCount);
     server.sendContent(hdr);
     server.sendContent("<div class='nav'><a href='/'>&#8592; home</a></div><div class='grid'>");
 
@@ -1836,21 +1907,25 @@ void handleGallery() {
         );
     }
 
-    if (files.empty()) {
+    if (fileCount == 0) {
         server.sendContent("<div class='empty'>SD empty</div>");
     } else {
-        for (auto& name : files) {
-            server.sendContent(
-                "<div class='card' id='c_" + name + "'>"
-                "<img class='thumb' src='/sd/" + name + "' loading='lazy'"
-                " onclick=\"window.open('/sd/" + name + "')\">"
-                "<div class='name'>" + name + "</div>"
+        char card[640];
+        for (int fi = 0; fi < fileCount; fi++) {
+            const char* n = fileNames[fi];
+            snprintf(card, sizeof(card),
+                "<div class='card' id='c_%s'>"
+                "<img class='thumb' src='/sd/%s' loading='lazy'"
+                " onclick=\"window.open('/sd/%s')\">"
+                "<div class='name'>%s</div>"
                 "<div class='acts'>"
-                "<a class='ae' href='/editor?file=" + name + "'>edit</a>"
-                "<a class='ab' href='/sd/" + name + "' download>save</a>"
-                "<a class='ad' onclick=\"delFoto('" + name + "');return false\">&#10005;</a>"
-                "</div></div>"
+                "<a class='ae' href='/editor?file=%s'>edit</a>"
+                "<a class='ab' href='/sd/%s' download>save</a>"
+                "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
+                "</div></div>",
+                n, n, n, n, n, n, n
             );
+            server.sendContent(card);
         }
     }
 
@@ -2020,6 +2095,7 @@ static void bootIntro() {
 
 void setup() {
     Serial.begin(115200);
+    Serial.printf("[BOOT] reason=%d heap=%u\n", esp_reset_reason(), esp_get_free_heap_size());
     pinMode(BTN_PIN,   INPUT_PULLUP);
     pinMode(LED_FLASH, OUTPUT);
     digitalWrite(LED_FLASH, LOW);
@@ -2670,15 +2746,36 @@ void loop() {
 
     if (wifiSetup) return;   // portal ativo: não roda VF, mantém tela de instrução
 
+    // diagnóstico: heartbeat a cada segundo — se parar de imprimir, fb_get travou
+    static unsigned long lastDbg = 0;
+    static uint32_t dbgFrames = 0;
+    dbgFrames++;
+    if (millis() - lastDbg >= 1000) {
+        Serial.printf("[DBG] heap:%u fps:%u\n",
+            esp_get_free_heap_size(), dbgFrames);
+        dbgFrames = 0;
+        lastDbg = millis();
+    }
+
     if (vfNeedsClear) {
         tft.fillScreen(ST77XX_BLACK);
         vfNeedsClear = false;
     }
 
     camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) return;
+    if (!fb) {
+        static int nullCount = 0;
+        if (++nullCount >= 10) {
+            nullCount = 0;
+            Serial.println("[CAM] reinit");
+            initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        }
+        delay(5);  // evita busy-loop quando cam retorna null
+        return;
+    }
 
-    if (++vfFrameCnt % 2 == 0) {
+    // autoExposure a cada 10 frames (era a cada 2) — reduz SCCB com WiFi ativo
+    if (++vfFrameCnt % 10 == 0) {
         autoExposure(measureLuma(fb->buf, fb->width, fb->height));
     }
 
