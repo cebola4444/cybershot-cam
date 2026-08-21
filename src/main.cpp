@@ -2162,7 +2162,12 @@ void setup() {
 
     // WiFi
     setupWiFi();
-    delay(800);
+
+    // reinit câmera após setupWiFi: limpa estado DMA corrompido pela interferência do rádio
+    delay(300);
+    initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    delay(500);
+
     tft.fillScreen(ST77XX_BLACK);
 }
 
@@ -2774,10 +2779,9 @@ void loop() {
         return;
     }
 
-    // autoExposure a cada 10 frames (era a cada 2) — reduz SCCB com WiFi ativo
-    if (++vfFrameCnt % 10 == 0) {
-        autoExposure(measureLuma(fb->buf, fb->width, fb->height));
-    }
+    // mede luma antes de processar — SCCB ocorre APÓS fb_return para não bloquear DMA
+    bool doAE = (++vfFrameCnt % 30 == 0);
+    int  aeLuma = doAE ? measureLuma(fb->buf, fb->width, fb->height) : 0;
 
     toGreenTones(fb->buf, fb->width, fb->height);
 
@@ -2791,6 +2795,9 @@ void loop() {
     tft.writePixels((uint16_t*)fb->buf, vfW * vfH, true, true);
     tft.endWrite();
 
-    esp_camera_fb_return(fb);
+    esp_camera_fb_return(fb);   // libera DMA antes de qualquer chamada SCCB
+
+    if (doAE) autoExposure(aeLuma);  // SCCB fora da janela crítica
+
     drawViewfinderOverlay();
 }
