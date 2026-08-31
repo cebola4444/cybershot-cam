@@ -199,6 +199,25 @@ WebServer server(80);
 
 bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
     esp_camera_deinit();
+    delay(50);
+
+    // I2C bus recovery: pulsa SCL 9× para liberar SDA presa pelo OV2640
+    // necessário pois PWDN e RESET são -1 (sem pinos de reset de hardware)
+    {
+        const gpio_num_t scl = (gpio_num_t)SIOC_GPIO_NUM;
+        const gpio_num_t sda = (gpio_num_t)SIOD_GPIO_NUM;
+        gpio_set_direction(scl, GPIO_MODE_OUTPUT);
+        gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
+        gpio_set_level(sda, 1);
+        for (int i = 0; i < 9; i++) {
+            gpio_set_level(scl, 0); delayMicroseconds(5);
+            gpio_set_level(scl, 1); delayMicroseconds(5);
+        }
+        gpio_set_level(sda, 0); delayMicroseconds(5);  // STOP: SDA↓ com SCL↑
+        gpio_set_level(scl, 1); delayMicroseconds(5);
+        gpio_set_level(sda, 1); delayMicroseconds(5);  // SDA↑ = bus livre
+    }
+
     camera_config_t cfg = {};
     cfg.ledc_channel  = LEDC_CHANNEL_0;
     cfg.ledc_timer    = LEDC_TIMER_0;
@@ -228,7 +247,10 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.fb_count     = fbCount;
     cfg.grab_mode    = CAMERA_GRAB_LATEST;
     cfg.fb_location  = CAMERA_FB_IN_PSRAM;
-    if (esp_camera_init(&cfg) != ESP_OK) return false;
+    if (esp_camera_init(&cfg) != ESP_OK) {
+        delay(300);
+        if (esp_camera_init(&cfg) != ESP_OK) return false;
+    }
     delay(200);
 
     sensor_t* s = esp_camera_sensor_get();
