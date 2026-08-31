@@ -152,8 +152,9 @@ void autoExposure(int avgLuma) {
     int diff = avgLuma - target;
     if (abs(diff) < LUMA_HYST) return;
 
-    // Step proporcional: quanto mais longe do alvo, mais rápido converge
-    int aecStep = constrain(abs(diff) / 8, 80, 350);
+    // step proporcional ao erro: longe do alvo = salto maior, perto = refinamento
+    int aecStep  = constrain(abs(diff) / 4, 100, 600);
+    int gainStep = constrain(abs(diff) / 600, 1, 6);
     bool changed = false;
 
     if (diff < 0) {  // muito escuro → aumenta exposição
@@ -161,12 +162,12 @@ void autoExposure(int avgLuma) {
             vfAecValue = min(1200, vfAecValue + aecStep);
             changed = true;
         } else if (vfAgcGain < 30) {
-            vfAgcGain = min(30, vfAgcGain + 2);
+            vfAgcGain = min(30, vfAgcGain + gainStep);
             changed = true;
         }
     } else {  // muito brilhante → reduz exposição
         if (vfAgcGain > 0) {
-            vfAgcGain = max(0, vfAgcGain - 2);
+            vfAgcGain = max(0, vfAgcGain - gainStep);
             changed = true;
         } else if (vfAecValue > 50) {
             vfAecValue = max(50, vfAecValue - aecStep);
@@ -2802,7 +2803,7 @@ void loop() {
     }
 
     // mede luma antes de processar — SCCB ocorre APÓS fb_return para não bloquear DMA
-    bool doAE = (++vfFrameCnt % 30 == 0);
+    bool doAE = (++vfFrameCnt % 10 == 0);
     int  aeLuma = doAE ? measureLuma(fb->buf, fb->width, fb->height) : 0;
 
     toGreenTones(fb->buf, fb->width, fb->height);
