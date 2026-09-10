@@ -200,7 +200,7 @@ WebServer server(80);
 
 bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
     esp_camera_deinit();
-    delay(150);
+    delay(50);
 
     // I2C bus recovery: pulsa SCL 9× para liberar SDA presa pelo OV2640
     // necessário pois PWDN e RESET são -1 (sem pinos de reset de hardware)
@@ -252,7 +252,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
         delay(300);
         if (esp_camera_init(&cfg) != ESP_OK) return false;
     }
-    delay(fmt == PIXFORMAT_JPEG ? 600 : 200);
+    delay(200);
 
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
@@ -2187,17 +2187,11 @@ void setup() {
     // Camera
     tft.setTextColor(0x7BEF);
     tft.setCursor(8, 38); tft.print("CAM  ...");
-    delay(300);  // tempo extra para OV2640 estabilizar no boot frio
-    bool camOK = false;
-    for (int attempt = 0; attempt < 3 && !camOK; attempt++) {
-        if (attempt > 0) delay(600);
-        camOK = initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-    }
-    if (!camOK) {
+    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
         tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
         tft.setTextColor(ST77XX_RED);
         tft.setCursor(8, 38); tft.print("CAM  FAIL");
-        delay(2000);
+        delay(3000);
         ESP.restart();
     }
     tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
