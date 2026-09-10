@@ -200,7 +200,7 @@ WebServer server(80);
 
 bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
     esp_camera_deinit();
-    delay(50);
+    delay(150);
 
     // I2C bus recovery: pulsa SCL 9× para liberar SDA presa pelo OV2640
     // necessário pois PWDN e RESET são -1 (sem pinos de reset de hardware)
@@ -252,7 +252,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
         delay(300);
         if (esp_camera_init(&cfg) != ESP_OK) return false;
     }
-    delay(fmt == PIXFORMAT_JPEG ? 400 : 200);
+    delay(fmt == PIXFORMAT_JPEG ? 600 : 200);
 
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
@@ -1182,20 +1182,44 @@ void takePhoto() {
     drawCaptureStatus(captureLabel, 5);
 
     // captura JPEG
-    if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, 2)) {
-        tft.fillScreen(ST77XX_BLACK);
-        tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
-        tft.setCursor(4, 55); tft.print("JPEG camera error");
-        delay(2000);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-        vfNeedsClear = true; return;
+    // tenta XGA; se warmup não produzir frames, tenta SVGA como fallback
+    framesize_t jpegSize = FRAMESIZE_XGA;
+    if (!initCamera(PIXFORMAT_JPEG, jpegSize, 12, 2)) {
+        jpegSize = FRAMESIZE_SVGA;
+        if (!initCamera(PIXFORMAT_JPEG, jpegSize, 12, 2)) {
+            tft.fillScreen(ST77XX_BLACK);
+            tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
+            tft.setCursor(4, 55); tft.print("JPEG camera error");
+            delay(2000);
+            initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+            vfNeedsClear = true; return;
+        }
     }
 
     drawCaptureStatus(captureLabel, 25);
     digitalWrite(LED_FLASH, HIGH);
+
+    // warmup: se nenhum frame chegar, o init não funcionou — tenta SVGA
+    int wOK = 0;
     for (int i = 0; i < 4; i++) {
         camera_fb_t* w = esp_camera_fb_get();
-        if (w) esp_camera_fb_return(w);
+        if (w) { wOK++; esp_camera_fb_return(w); }
+    }
+    if (wOK == 0 && jpegSize == FRAMESIZE_XGA) {
+        jpegSize = FRAMESIZE_SVGA;
+        if (!initCamera(PIXFORMAT_JPEG, jpegSize, 12, 2)) {
+            digitalWrite(LED_FLASH, LOW);
+            tft.fillScreen(ST77XX_BLACK);
+            tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
+            tft.setCursor(4, 55); tft.print("JPEG camera error");
+            delay(2000);
+            initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+            vfNeedsClear = true; return;
+        }
+        for (int i = 0; i < 4; i++) {
+            camera_fb_t* w = esp_camera_fb_get();
+            if (w) esp_camera_fb_return(w);
+        }
     }
 
     drawCaptureStatus(captureLabel, 50);
@@ -2173,11 +2197,18 @@ void setup() {
     // Camera
     tft.setTextColor(0x7BEF);
     tft.setCursor(8, 38); tft.print("CAM  ...");
-    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
+    delay(300);  // tempo extra para OV2640 estabilizar no boot frio
+    bool camOK = false;
+    for (int attempt = 0; attempt < 3 && !camOK; attempt++) {
+        if (attempt > 0) delay(600);
+        camOK = initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    }
+    if (!camOK) {
         tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
         tft.setTextColor(ST77XX_RED);
         tft.setCursor(8, 38); tft.print("CAM  FAIL");
-        while (true) delay(1000);
+        delay(2000);
+        ESP.restart();
     }
     tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
     tft.setTextColor(ST77XX_GREEN);
