@@ -1181,45 +1181,22 @@ void takePhoto() {
     const char* captureLabel = "CAPTURING...";
     drawCaptureStatus(captureLabel, 5);
 
-    // captura JPEG
-    // tenta XGA; se warmup não produzir frames, tenta SVGA como fallback
-    framesize_t jpegSize = FRAMESIZE_XGA;
-    if (!initCamera(PIXFORMAT_JPEG, jpegSize, 12, 2)) {
-        jpegSize = FRAMESIZE_SVGA;
-        if (!initCamera(PIXFORMAT_JPEG, jpegSize, 12, 2)) {
-            tft.fillScreen(ST77XX_BLACK);
-            tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
-            tft.setCursor(4, 55); tft.print("JPEG camera error");
-            delay(2000);
-            initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-            vfNeedsClear = true; return;
-        }
+    // captura em RGB565 SVGA — mesmo formato do viewfinder, só resolução maior.
+    // evita troca de formato JPEG que desestabiliza OV2640 sem pinos RESET/PWDN.
+    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_SVGA, 12, 1)) {
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
+        tft.setCursor(4, 55); tft.print("Camera error");
+        delay(2000);
+        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        vfNeedsClear = true; return;
     }
 
     drawCaptureStatus(captureLabel, 25);
     digitalWrite(LED_FLASH, HIGH);
-
-    // warmup: se nenhum frame chegar, o init não funcionou — tenta SVGA
-    int wOK = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         camera_fb_t* w = esp_camera_fb_get();
-        if (w) { wOK++; esp_camera_fb_return(w); }
-    }
-    if (wOK == 0 && jpegSize == FRAMESIZE_XGA) {
-        jpegSize = FRAMESIZE_SVGA;
-        if (!initCamera(PIXFORMAT_JPEG, jpegSize, 12, 2)) {
-            digitalWrite(LED_FLASH, LOW);
-            tft.fillScreen(ST77XX_BLACK);
-            tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
-            tft.setCursor(4, 55); tft.print("JPEG camera error");
-            delay(2000);
-            initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-            vfNeedsClear = true; return;
-        }
-        for (int i = 0; i < 4; i++) {
-            camera_fb_t* w = esp_camera_fb_get();
-            if (w) esp_camera_fb_return(w);
-        }
+        if (w) esp_camera_fb_return(w);
     }
 
     drawCaptureStatus(captureLabel, 50);
@@ -1235,14 +1212,27 @@ void takePhoto() {
         vfNeedsClear = true; return;
     }
 
-    if (photoBuf) { free(photoBuf); photoBuf = nullptr; }
-    photoBuf = (uint8_t*)ps_malloc(fb->len);
-    if (photoBuf) {
-        memcpy(photoBuf, fb->buf, fb->len);
-        photoLen   = fb->len;
-        photoReady = true;
-    }
+    // encode RGB565 → JPEG por software
+    drawCaptureStatus("ENCODING...", 75);
+    uint8_t* jpegBuf = nullptr;
+    size_t   jpegLen = 0;
+    bool encOK = frame2jpg(fb, 12, &jpegBuf, &jpegLen);
     esp_camera_fb_return(fb); fb = nullptr;
+
+    if (!encOK || !jpegBuf || jpegLen == 0) {
+        if (jpegBuf) free(jpegBuf);
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
+        tft.setCursor(4, 55); tft.print("Encode error");
+        delay(2000);
+        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        vfNeedsClear = true; return;
+    }
+
+    if (photoBuf) { free(photoBuf); photoBuf = nullptr; }
+    photoBuf  = jpegBuf;   // frame2jpg já aloca em PSRAM
+    photoLen  = jpegLen;
+    photoReady = true;
 
     // JPEG FX: databending em photoBuf
     if (photoBuf && (fxDQT || fxScan || fxChroma || fxZigzag || fxDHT)) {
