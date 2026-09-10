@@ -239,22 +239,40 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
-    cfg.xclk_freq_hz = 10000000;  // fixo 10 MHz em todos os modos — evita re-lock do PLL do OV2640
+    // VF em 10 MHz (calibração de exposição); JPEG em 20 MHz — o driver faz soft-reset
+    // e reprograma o sensor inteiro a cada init, então a troca de XCLK é segura.
+    cfg.xclk_freq_hz = (fmt == PIXFORMAT_JPEG) ? 20000000 : 10000000;
 
     cfg.pixel_format = fmt;
-    cfg.frame_size   = size;
+    // JPEG: o driver dimensiona o frame buffer pelo frame_size do init (w*h/5).
+    // XGA daria só ~154 KB — estoura com ruído de ganho alto (pouca luz), o driver
+    // descarta o frame (sem EOI), fb_get expira e vira "Capture error".
+    // Inicia em UXGA (~375 KB de buffer) e reduz para o tamanho pedido via set_framesize.
+    cfg.frame_size   = (fmt == PIXFORMAT_JPEG) ? FRAMESIZE_UXGA : size;
     cfg.jpeg_quality = quality;
     cfg.fb_count     = fbCount;
     cfg.grab_mode    = CAMERA_GRAB_LATEST;
     cfg.fb_location  = CAMERA_FB_IN_PSRAM;
-    if (esp_camera_init(&cfg) != ESP_OK) {
+
+    unsigned long t0 = millis();
+    esp_err_t err = esp_camera_init(&cfg);
+    if (err != ESP_OK) {
+        Serial.printf("[CAM] init falhou (0x%x) fmt=%d — retry\n", err, fmt);
         delay(300);
-        if (esp_camera_init(&cfg) != ESP_OK) return false;
+        err = esp_camera_init(&cfg);
+        if (err != ESP_OK) {
+            Serial.printf("[CAM] init falhou de novo (0x%x)\n", err);
+            return false;
+        }
     }
     delay(200);
 
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
+        if (fmt == PIXFORMAT_JPEG && size != FRAMESIZE_UXGA) {
+            s->set_framesize(s, size);
+            delay(100);
+        }
         s->set_hmirror(s, 1);
         s->set_brightness(s, 1);
         s->set_gainceiling(s, GAINCEILING_128X);
@@ -266,14 +284,15 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_aec_value(s, vfAecValue);
             s->set_agc_gain(s, vfAgcGain);
         } else {
-            // JPEG — mesmo XCLK (10 MHz), usa exposição direta do viewfinder
-            s->set_whitebal(s, 1);
+            // XCLK=20 MHz (2× do VF); dobra aec_value para manter exposição equivalente
+            s->set_whitebal(s, 1);    // AWB ligado — corrige dominância de cor
             s->set_awb_gain(s, 1);
-            s->set_wb_mode(s, 0);
-            s->set_aec_value(s, vfAecValue);
+            s->set_wb_mode(s, 0);     // balanço automático
+            s->set_aec_value(s, min(1200, vfAecValue * 2));
             s->set_agc_gain(s, vfAgcGain);
         }
     }
+    Serial.printf("[CAM] init ok fmt=%d size=%d fb=%d (%lums)\n", fmt, size, fbCount, millis() - t0);
     return true;
 }
 
@@ -1200,13 +1219,21 @@ void takePhoto() {
     drawCaptureStatus(captureLabel, 25);
     digitalWrite(LED_FLASH, HIGH);
     for (int i = 0; i < 2; i++) {
+        unsigned long tw = millis();
         camera_fb_t* w = esp_camera_fb_get();
+        Serial.printf("[CAP] warmup %d: %s len=%u (%lums)\n", i, w ? "ok" : "NULL",
+                      w ? (unsigned)w->len : 0, millis() - tw);
         if (w) esp_camera_fb_return(w);
     }
 
     drawCaptureStatus(captureLabel, 50);
+    unsigned long tc = millis();
     camera_fb_t* fb = esp_camera_fb_get();
     digitalWrite(LED_FLASH, LOW);
+    Serial.printf("[CAP] frame: %s len=%u %ux%u (%lums) aec=%d gain=%d\n",
+                  fb ? "ok" : "NULL", fb ? (unsigned)fb->len : 0,
+                  fb ? (unsigned)fb->width : 0, fb ? (unsigned)fb->height : 0,
+                  millis() - tc, vfAecValue, vfAgcGain);
 
     if (!fb) {
         tft.fillScreen(ST77XX_BLACK);
@@ -2804,15 +2831,19 @@ void loop() {
         vfNeedsClear = false;
     }
 
+    unsigned long tf = millis();
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
+        // NULL imediato = driver não inicializado; NULL após >1 s = DMA sem frames (timeout)
         static int nullCount = 0;
-        if (++nullCount >= 10) {
+        bool timedOut = (millis() - tf) > 1000;
+        if (timedOut || ++nullCount >= 3) {
             nullCount = 0;
-            Serial.println("[CAM] reinit");
+            Serial.printf("[CAM] VF sem frame (%s) — reinit\n", timedOut ? "timeout" : "null");
+            delay(200);
             initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
         }
-        delay(5);  // evita busy-loop quando cam retorna null
+        delay(5);
         return;
     }
 
