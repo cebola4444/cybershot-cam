@@ -30,6 +30,7 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "SD_MMC.h"
+#include "esp_log.h"
 
 DNSServer    dnsServer;
 Preferences  wifiPrefs;
@@ -196,6 +197,63 @@ SPIClass        tftSPI(FSPI);
 Adafruit_ST7735 tft(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 WebServer server(80);
 
+// ─── Log em RAM ──────────────────────────────────────────────────────────────
+// GPIO43 (TX0) é o CS do display: o serial USB só recebe lixo do SPI. O log fica
+// num ring em RAM, aparece na tela quando a captura falha e em http://<ip>/log.
+// esp_log_set_vprintf captura também os erros internos do driver da câmera.
+
+static const int LOG_LINES = 64;
+static const int LOG_W     = 64;
+static char          logRing[LOG_LINES][LOG_W];
+static int           logHead  = 0;
+static int           logCount = 0;
+static portMUX_TYPE  logMux   = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t logOrigVprintf = nullptr;
+
+static void logPush(const char* s) {
+    char line[LOG_W];
+    int n = 0;
+    for (const char* p = s; *p && n < LOG_W - 1; p++) {
+        if (*p == '\r' || *p == '\n') continue;
+        if (*p == 0x1B) { while (*p && *p != 'm') p++; if (!*p) break; continue; }  // cores ANSI
+        line[n++] = *p;
+    }
+    line[n] = '\0';
+    if (n == 0) return;
+    portENTER_CRITICAL(&logMux);
+    memcpy(logRing[logHead], line, LOG_W);
+    logHead = (logHead + 1) % LOG_LINES;
+    if (logCount < LOG_LINES) logCount++;
+    portEXIT_CRITICAL(&logMux);
+}
+
+static void dlog(const char* fmt, ...) {
+    char buf[LOG_W + 32];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    logPush(buf);
+    Serial.println(buf);
+}
+
+static int logVprintf(const char* fmt, va_list ap) {
+    char buf[160];
+    va_list ap2; va_copy(ap2, ap);
+    vsnprintf(buf, sizeof(buf), fmt, ap2);
+    va_end(ap2);
+    logPush(buf);
+    return logOrigVprintf ? logOrigVprintf(fmt, ap) : (int)strlen(buf);
+}
+
+// copia a linha i (0 = mais antiga) para out[LOG_W]; false se não existe
+static bool logGet(int i, char* out) {
+    portENTER_CRITICAL(&logMux);
+    bool ok = (i >= 0 && i < logCount);
+    if (ok) memcpy(out, logRing[(logHead - logCount + i + LOG_LINES) % LOG_LINES], LOG_W);
+    portEXIT_CRITICAL(&logMux);
+    return ok;
+}
+
 // ─── Câmera ───────────────────────────────────────────────────────────────────
 
 bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
@@ -257,11 +315,11 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     unsigned long t0 = millis();
     esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
-        Serial.printf("[CAM] init falhou (0x%x) fmt=%d — retry\n", err, fmt);
+        dlog("[CAM] init fail 0x%x %s", err, fmt == PIXFORMAT_JPEG ? "JPEG" : "RGB");
         delay(300);
         err = esp_camera_init(&cfg);
         if (err != ESP_OK) {
-            Serial.printf("[CAM] init falhou de novo (0x%x)\n", err);
+            dlog("[CAM] init fail2 0x%x", err);
             return false;
         }
     }
@@ -292,7 +350,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_agc_gain(s, vfAgcGain);
         }
     }
-    Serial.printf("[CAM] init ok fmt=%d size=%d fb=%d (%lums)\n", fmt, size, fbCount, millis() - t0);
+    dlog("[CAM] init %s ok %lums", fmt == PIXFORMAT_JPEG ? "JPEG" : "RGB", millis() - t0);
     return true;
 }
 
@@ -400,6 +458,7 @@ void handleDelete();
 void handleSDFile();
 void handleSaveEdit();
 void handleSaveEditUpload();
+void handleLog();
 
 void setupWebServer();   // forward declaration
 
@@ -585,10 +644,11 @@ void setupWebServer() {
     server.on("/editor",    handleEditor);
     server.on("/delete",    handleDelete);
     server.on("/save-edit", HTTP_POST, handleSaveEdit, handleSaveEditUpload);
+    server.on("/log",       handleLog);
     server.onNotFound(handleSDFile);
     server.begin();
     IPAddress ip = wifiAP ? WiFi.softAPIP() : WiFi.localIP();
-    Serial.printf("http://%s\n", ip.toString().c_str());
+    dlog("[WEB] http://%s", ip.toString().c_str());
 }
 
 // Tenta STA com credenciais salvas na NVS. Se não houver ou falhar, fica offline.
@@ -622,6 +682,7 @@ void setupWiFi() {
         tft.printf("WIFI %s", WiFi.localIP().toString().c_str());
     } else {
         WiFi.disconnect(true);
+        dlog("[WIFI] fail");
         tft.setTextColor(ST77XX_YELLOW);
         tft.print("WIFI failed");
     }
@@ -944,6 +1005,63 @@ void drawCaptureStatus(const char* label, int pct) {
     tft.printf("%d%%", pct);
 }
 
+// Tela de diagnóstico: título + últimas linhas do log. Espera BTN ou 20 s.
+static void showDiagScreen(const char* title) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(2, 2); tft.print(title);
+    tft.drawFastHLine(0, 11, 160, 0x7BEF);
+    const int maxLines = 12;
+    int first = logCount > maxLines ? logCount - maxLines : 0;
+    tft.setTextColor(0x7BEF);
+    char line[LOG_W];
+    for (int i = first, row = 0; logGet(i, line); i++, row++) {
+        line[26] = '\0';   // 26 colunas de 6 px — sem quebra de linha
+        tft.setCursor(2, 14 + row * 9);
+        tft.print(line);
+    }
+    tft.setTextColor(0x2965);
+    tft.setCursor(2, 120); tft.print("[BTN] close");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 20000) {
+        if (digitalRead(BTN_PIN) == LOW) { delay(180); break; }
+        delay(10);
+    }
+}
+
+// Volta ao modo viewfinder após captura/erro, com retry.
+static void restoreViewfinder() {
+    delay(200);
+    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
+        delay(400);
+        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    }
+    vfNeedsClear = true;
+}
+
+// Init JPEG XGA e confirma que o DMA entrega um frame. Nesta placa (sem RESET/PWDN,
+// driver S3) o init às vezes retorna OK sem nenhum frame chegar — um novo init resolve.
+static bool initJpegWithRetry(uint8_t fbCount, bool led, const char* label, int pctA, int pctB) {
+    for (int t = 1; t <= 3; t++) {
+        if (t > 1) delay(300);
+        drawCaptureStatus(label, pctA);
+        if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, fbCount)) {
+            dlog("[CAP] t%d init JPEG fail", t);
+            continue;
+        }
+        drawCaptureStatus(label, pctB);
+        if (led) digitalWrite(LED_FLASH, HIGH);
+        unsigned long tw = millis();
+        camera_fb_t* w = esp_camera_fb_get();
+        dlog("[CAP] t%d w0 %s %uB %lums", t, w ? "ok" : "NULL",
+             w ? (unsigned)w->len : 0, millis() - tw);
+        if (w) { esp_camera_fb_return(w); return true; }
+        if (led) digitalWrite(LED_FLASH, LOW);
+    }
+    return false;
+}
+
 // ─── Preview JPEG no TFT ─────────────────────────────────────────────────────
 
 static JPEGDEC  _jpeg;
@@ -1020,9 +1138,10 @@ void takeLongExposureStacked() {
     drawCaptureStatus("SETTLING...", 3);
 
     // JPEG XGA: uint16_t acumuladores = 4.5MB (cabe nos 8MB PSRAM)
-    if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, 2)) {
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-        vfNeedsClear = true; return;
+    if (!initJpegWithRetry(2, false, "SETTLING...", 3, 4)) {
+        showDiagScreen("JPEG CAMERA ERROR");
+        restoreViewfinder();
+        return;
     }
 
     // Começa com exposição máxima, habilita AE auto — converge de cima pra baixo (rápido)
@@ -1098,10 +1217,12 @@ void takeLongExposureStacked() {
     g_leR = g_leG = g_leB = nullptr;
     drawCaptureStatus("PROCESSING...", 92);
 
+    dlog("[LE] %d frames em %ds", frameCount, leSeconds);
     if (frameCount == 0) {
         free(accR); free(accG); free(accB);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-        vfNeedsClear = true; return;
+        showDiagScreen("LONG EXP ERROR");
+        restoreViewfinder();
+        return;
     }
 
     // Mede luma média (bits raw: R/B em 0-31, G em 0-63) → escala para 0.0-1.0
@@ -1175,11 +1296,7 @@ void takeLongExposureStacked() {
     char filename[32] = "";
     bool savedSD = saveToSD(photoBuf, photoLen, filename);
 
-    delay(200);
-    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
-        delay(400);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-    }
+    restoreViewfinder();
     drawCaptureStatus("DONE!", 100);
 
     if (photoBuf) {
@@ -1203,26 +1320,18 @@ void takePhoto() {
     const char* captureLabel = "CAPTURING...";
     drawCaptureStatus(captureLabel, 5);
 
-    // captura JPEG XGA
-    if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, 1)) {
-        tft.fillScreen(ST77XX_BLACK);
-        tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
-        tft.setCursor(4, 55); tft.print("JPEG camera error");
-        delay(2000);
-        delay(200);
-        if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
-            delay(400); initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-        }
-        vfNeedsClear = true; return;
+    // captura JPEG XGA — init com retry; o helper já liga o LED e consome o 1º frame
+    dlog("[CAP] aec=%d gain=%d", vfAecValue, vfAgcGain);
+    if (!initJpegWithRetry(1, true, captureLabel, 5, 25)) {
+        showDiagScreen("JPEG CAMERA ERROR");
+        restoreViewfinder();
+        return;
     }
 
-    drawCaptureStatus(captureLabel, 25);
-    digitalWrite(LED_FLASH, HIGH);
-    for (int i = 0; i < 2; i++) {
+    {
         unsigned long tw = millis();
         camera_fb_t* w = esp_camera_fb_get();
-        Serial.printf("[CAP] warmup %d: %s len=%u (%lums)\n", i, w ? "ok" : "NULL",
-                      w ? (unsigned)w->len : 0, millis() - tw);
+        dlog("[CAP] w1 %s %uB %lums", w ? "ok" : "NULL", w ? (unsigned)w->len : 0, millis() - tw);
         if (w) esp_camera_fb_return(w);
     }
 
@@ -1230,21 +1339,12 @@ void takePhoto() {
     unsigned long tc = millis();
     camera_fb_t* fb = esp_camera_fb_get();
     digitalWrite(LED_FLASH, LOW);
-    Serial.printf("[CAP] frame: %s len=%u %ux%u (%lums) aec=%d gain=%d\n",
-                  fb ? "ok" : "NULL", fb ? (unsigned)fb->len : 0,
-                  fb ? (unsigned)fb->width : 0, fb ? (unsigned)fb->height : 0,
-                  millis() - tc, vfAecValue, vfAgcGain);
+    dlog("[CAP] frame %s %uB %lums", fb ? "ok" : "NULL", fb ? (unsigned)fb->len : 0, millis() - tc);
 
     if (!fb) {
-        tft.fillScreen(ST77XX_BLACK);
-        tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
-        tft.setCursor(4, 55); tft.print("Capture error");
-        delay(2000);
-        delay(200);
-        if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
-            delay(400); initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-        }
-        vfNeedsClear = true; return;
+        showDiagScreen("CAPTURE ERROR");
+        restoreViewfinder();
+        return;
     }
 
     if (photoBuf) { free(photoBuf); photoBuf = nullptr; }
@@ -1279,13 +1379,8 @@ void takePhoto() {
     char filename[32] = "";
     bool savedSD = saveToSD(photoBuf, photoLen, filename);
 
-    // reinicia câmera no modo viewfinder (delay antes para OV2640 sair do modo JPEG)
-    delay(200);
-    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
-        delay(400);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
-    }
-
+    dlog("[CAP] saved %s", savedSD ? filename + 1 : "RAM");
+    restoreViewfinder();
     drawCaptureStatus("DONE!", 100);
 
     // exibe preview no TFT
@@ -1864,6 +1959,16 @@ void handleSaveEdit() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+void handleLog() {
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain; charset=utf-8", "");
+    char line[LOG_W];
+    for (int i = 0; logGet(i, line); i++) {
+        server.sendContent(line);
+        server.sendContent("\n");
+    }
+}
+
 void handleRoot() {
     if (wifiSetup) { handleSetupPage(); return; }  // portal ativo: delega pro setup
     String html =
@@ -1871,7 +1976,7 @@ void handleRoot() {
         "<style>body{background:#000;color:#0f0;font-family:monospace;text-align:center}"
         "a{color:#0f0}</style></head><body>"
         "<h2>CYBER SHOT</h2>"
-        "<p><a href='/galeria'>SD gallery</a></p>";
+        "<p><a href='/galeria'>SD gallery</a> &nbsp; <a href='/log'>[log]</a></p>";
     if (photoReady)
         html += "<p><a href='/foto'>last photo (RAM)</a>"
                 " &nbsp; <a href='/editor?ram=1'>[edit]</a></p>";
@@ -2158,7 +2263,8 @@ static void bootIntro() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.printf("[BOOT] reason=%d heap=%u\n", esp_reset_reason(), esp_get_free_heap_size());
+    logOrigVprintf = esp_log_set_vprintf(logVprintf);   // erros do driver da câmera → log em RAM
+    dlog("[BOOT] rst=%d heap=%u", esp_reset_reason(), esp_get_free_heap_size());
     pinMode(BTN_PIN,   INPUT_PULLUP);
     pinMode(LED_FLASH, OUTPUT);
     digitalWrite(LED_FLASH, LOW);
@@ -2815,13 +2921,12 @@ void loop() {
 
     if (wifiSetup) return;   // portal ativo: não roda VF, mantém tela de instrução
 
-    // diagnóstico: heartbeat a cada segundo — se parar de imprimir, fb_get travou
+    // heartbeat a cada 5 s no log em RAM (heap + fps do viewfinder)
     static unsigned long lastDbg = 0;
     static uint32_t dbgFrames = 0;
     dbgFrames++;
-    if (millis() - lastDbg >= 1000) {
-        Serial.printf("[DBG] heap:%u fps:%u\n",
-            esp_get_free_heap_size(), dbgFrames);
+    if (millis() - lastDbg >= 5000) {
+        dlog("[VF] heap %u fps %u", esp_get_free_heap_size(), dbgFrames / 5);
         dbgFrames = 0;
         lastDbg = millis();
     }
@@ -2839,7 +2944,7 @@ void loop() {
         bool timedOut = (millis() - tf) > 1000;
         if (timedOut || ++nullCount >= 3) {
             nullCount = 0;
-            Serial.printf("[CAM] VF sem frame (%s) — reinit\n", timedOut ? "timeout" : "null");
+            dlog("[VF] no frame (%s) reinit", timedOut ? "timeout" : "null");
             delay(200);
             initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
         }
