@@ -1157,7 +1157,11 @@ void takeLongExposureStacked() {
     char filename[32] = "";
     bool savedSD = saveToSD(photoBuf, photoLen, filename);
 
-    initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    delay(200);
+    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
+        delay(400);
+        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    }
     drawCaptureStatus("DONE!", 100);
 
     if (photoBuf) {
@@ -1243,8 +1247,12 @@ void takePhoto() {
     char filename[32] = "";
     bool savedSD = saveToSD(photoBuf, photoLen, filename);
 
-    // reinicia câmera no modo viewfinder
-    initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    // reinicia câmera no modo viewfinder (delay antes para OV2640 sair do modo JPEG)
+    delay(200);
+    if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
+        delay(400);
+        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+    }
 
     drawCaptureStatus("DONE!", 100);
 
