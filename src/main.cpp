@@ -239,7 +239,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
-    cfg.xclk_freq_hz = 20000000;  // fixo 20 MHz em todos os modos — evita re-lock do PLL do OV2640
+    cfg.xclk_freq_hz = 10000000;  // fixo 10 MHz em todos os modos — evita re-lock do PLL do OV2640
 
     cfg.pixel_format = fmt;
     cfg.frame_size   = size;
@@ -266,7 +266,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_aec_value(s, vfAecValue);
             s->set_agc_gain(s, vfAgcGain);
         } else {
-            // JPEG — mesmo XCLK (20 MHz), usa exposição direta do viewfinder
+            // JPEG — mesmo XCLK (10 MHz), usa exposição direta do viewfinder
             s->set_whitebal(s, 1);
             s->set_awb_gain(s, 1);
             s->set_wb_mode(s, 0);
