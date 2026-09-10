@@ -252,7 +252,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
         delay(300);
         if (esp_camera_init(&cfg) != ESP_OK) return false;
     }
-    delay(200);
+    delay(fmt == PIXFORMAT_JPEG ? 400 : 200);
 
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
@@ -1182,7 +1182,7 @@ void takePhoto() {
     drawCaptureStatus(captureLabel, 5);
 
     // captura JPEG
-    if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, 1)) {
+    if (!initCamera(PIXFORMAT_JPEG, FRAMESIZE_XGA, 12, 2)) {
         tft.fillScreen(ST77XX_BLACK);
         tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
         tft.setCursor(4, 55); tft.print("JPEG camera error");
@@ -1193,7 +1193,7 @@ void takePhoto() {
 
     drawCaptureStatus(captureLabel, 25);
     digitalWrite(LED_FLASH, HIGH);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         camera_fb_t* w = esp_camera_fb_get();
         if (w) esp_camera_fb_return(w);
     }
