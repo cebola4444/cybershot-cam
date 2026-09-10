@@ -239,8 +239,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
-    if (fmt == PIXFORMAT_RGB565) cfg.xclk_freq_hz = 10000000;
-    else                         cfg.xclk_freq_hz = 20000000;
+    cfg.xclk_freq_hz = 20000000;  // fixo 20 MHz em todos os modos — evita re-lock do PLL do OV2640
 
     cfg.pixel_format = fmt;
     cfg.frame_size   = size;
@@ -267,11 +266,11 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_aec_value(s, vfAecValue);
             s->set_agc_gain(s, vfAgcGain);
         } else {
-            // XCLK=20 MHz (2× do VF); dobra aec_value para manter exposição equivalente
-            s->set_whitebal(s, 1);    // AWB ligado — corrige dominância de cor
+            // JPEG — mesmo XCLK (20 MHz), usa exposição direta do viewfinder
+            s->set_whitebal(s, 1);
             s->set_awb_gain(s, 1);
-            s->set_wb_mode(s, 0);     // balanço automático
-            s->set_aec_value(s, min(1200, vfAecValue * 2));
+            s->set_wb_mode(s, 0);
+            s->set_aec_value(s, vfAecValue);
             s->set_agc_gain(s, vfAgcGain);
         }
     }
@@ -1191,7 +1190,10 @@ void takePhoto() {
         tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
         tft.setCursor(4, 55); tft.print("JPEG camera error");
         delay(2000);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        delay(200);
+        if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
+            delay(400); initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        }
         vfNeedsClear = true; return;
     }
 
@@ -1211,7 +1213,10 @@ void takePhoto() {
         tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
         tft.setCursor(4, 55); tft.print("Capture error");
         delay(2000);
-        initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        delay(200);
+        if (!initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2)) {
+            delay(400); initCamera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 12, 2);
+        }
         vfNeedsClear = true; return;
     }
 
