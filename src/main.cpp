@@ -115,6 +115,8 @@ const char* VF_COLOR_NAMES[] = { "VERDE", "VERMELHO", "ROSA", "BRANCO", "CIANO" 
 static int  vfColorIdx   = 0;
 static int  leSeconds    = 0;   // 0=OFF, 3, 5, 10
 static int  evComp       = 0;    // compensação de exposição: -3 a +3 stops
+static bool videoMode    = false;   // MODE no menu: disparo grava vídeo em vez de foto
+static const int VIDEO_SECS = 10;
 
 // ─── Auto-exposição ───────────────────────────────────────────────────────────
 // Valores calibrados pelo viewfinder, reaproveitados na captura (ver captureExposureFromVf).
@@ -467,7 +469,11 @@ void drawViewfinderOverlay() {
     tft.setTextSize(1);
 
     // indicadores de modo (canto superior)
-    if (leSeconds > 0) {
+    if (videoMode) {
+        tft.setTextColor(ST77XX_RED);
+        tft.setCursor(2, 2);
+        tft.print("VID");
+    } else if (leSeconds > 0) {
         tft.setTextColor(vfPalettes[vfColorIdx][2]);
         tft.setCursor(2, 2);
         char leLabel[6];
@@ -1184,6 +1190,16 @@ static void upscaleToVf() {
     }
 }
 
+// Desenha decBuf (frame já decodificado a 1/8) no TFT com a paleta do VF.
+static void drawVfFrame() {
+    toGreenTones(decBuf, DEC_W, DEC_H);
+    upscaleToVf();
+    tft.startWrite();
+    tft.setAddrWindow(0, (128 - VF_H) / 2, VF_W, VF_H);
+    tft.writePixels((uint16_t*)vfBuf, VF_W * VF_H, true, true);
+    tft.endWrite();
+}
+
 // Próximo frame XGA completo (≥ 20 KB; frames QQVGA antigos na fila são menores). NULL = nada.
 static camera_fb_t* camNextXgaFrame() {
     for (int i = 0; i < 6; i++) {
@@ -1399,6 +1415,186 @@ void takeLongExposureStacked() {
     } else {
         vfNeedsClear = true;
     }
+}
+
+// ─── Vídeo: MJPEG em container AVI ───────────────────────────────────────────
+// Os frames JPEG do sensor vão direto para o SD (sem recodificar); o navegador/celular
+// decodifica. Cabeçalho fixo de 224 bytes escrito com placeholders e reescrito no fim.
+
+static void aviW32(File& f, uint32_t v) {
+    uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
+    f.write(b, 4);
+}
+static void aviW16(File& f, uint16_t v) { uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)}; f.write(b, 2); }
+static void aviTag(File& f, const char* t) { f.write((const uint8_t*)t, 4); }
+
+static const uint32_t AVI_HDR_SIZE = 224;   // 1º chunk de frame começa aqui
+static const uint32_t AVI_MOVI_TAG = 220;   // posição do fourcc 'movi' (base dos offsets do idx1)
+static const int      VIDEO_MAX_FRAMES = 160;
+
+static void aviWriteHeader(File& f, int w, int h, uint32_t frames, uint32_t usPerFrame,
+                           uint32_t maxFrame, uint32_t moviSize, uint32_t fileSize) {
+    f.seek(0);
+    aviTag(f, "RIFF"); aviW32(f, fileSize ? fileSize - 8 : 0); aviTag(f, "AVI ");
+    aviTag(f, "LIST"); aviW32(f, 192); aviTag(f, "hdrl");
+    aviTag(f, "avih"); aviW32(f, 56);
+    aviW32(f, usPerFrame);                                                             // dwMicroSecPerFrame
+    aviW32(f, usPerFrame ? (uint32_t)((uint64_t)maxFrame * 1000000ULL / usPerFrame) : 0); // dwMaxBytesPerSec
+    aviW32(f, 0);                     // dwPaddingGranularity
+    aviW32(f, 0x10);                  // dwFlags: AVIF_HASINDEX
+    aviW32(f, frames);                // dwTotalFrames
+    aviW32(f, 0);                     // dwInitialFrames
+    aviW32(f, 1);                     // dwStreams
+    aviW32(f, maxFrame);              // dwSuggestedBufferSize
+    aviW32(f, w); aviW32(f, h);
+    aviW32(f, 0); aviW32(f, 0); aviW32(f, 0); aviW32(f, 0);   // dwReserved[4]
+    aviTag(f, "LIST"); aviW32(f, 116); aviTag(f, "strl");
+    aviTag(f, "strh"); aviW32(f, 56);
+    aviTag(f, "vids"); aviTag(f, "MJPG");
+    aviW32(f, 0);                     // dwFlags
+    aviW16(f, 0); aviW16(f, 0);       // wPriority, wLanguage
+    aviW32(f, 0);                     // dwInitialFrames
+    aviW32(f, usPerFrame ? usPerFrame : 1);   // dwScale (µs por frame)
+    aviW32(f, 1000000);               // dwRate → fps = dwRate / dwScale
+    aviW32(f, 0);                     // dwStart
+    aviW32(f, frames);                // dwLength
+    aviW32(f, maxFrame);              // dwSuggestedBufferSize
+    aviW32(f, 0xFFFFFFFF);            // dwQuality (default)
+    aviW32(f, 0);                     // dwSampleSize
+    aviW16(f, 0); aviW16(f, 0); aviW16(f, (uint16_t)w); aviW16(f, (uint16_t)h);   // rcFrame
+    aviTag(f, "strf"); aviW32(f, 40);
+    aviW32(f, 40); aviW32(f, w); aviW32(f, h);
+    aviW16(f, 1); aviW16(f, 24);
+    aviTag(f, "MJPG");
+    aviW32(f, (uint32_t)w * h * 3);
+    aviW32(f, 0); aviW32(f, 0); aviW32(f, 0); aviW32(f, 0);
+    aviTag(f, "LIST"); aviW32(f, moviSize); aviTag(f, "movi");
+}
+
+static void drawRecOverlay(int secLeft, int pct, bool dot) {
+    tft.setTextSize(1);
+    tft.fillRect(0, 0, 160, 10, ST77XX_BLACK);
+    if (dot) tft.fillCircle(6, 5, 3, ST77XX_RED);
+    tft.setTextColor(ST77XX_RED);   tft.setCursor(14, 1);  tft.print("REC");
+    tft.setTextColor(ST77XX_WHITE); tft.setCursor(126, 1); tft.printf("%2ds", secLeft);
+    tft.fillRect(0, 124, 160, 4, ST77XX_BLACK);
+    tft.fillRect(0, 124, 160 * pct / 100, 4, ST77XX_RED);
+}
+
+static void showSimpleError(const char* msg) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
+    tft.setCursor(8, 58); tft.print(msg);
+    delay(1500);
+    vfNeedsClear = true;
+}
+
+// Grava VIDEO_SECS segundos de MJPEG. Exposição fica travada nos valores do VF; glitches
+// JPEG ativos são aplicados frame a frame; VF a ~4 fps durante a gravação; BTN para antes.
+void recordVideo() {
+    if (!sdOK) { showSimpleError("NO SD CARD"); return; }
+
+    char name[32];
+    do {
+        photoCount++;
+        snprintf(name, sizeof(name), "/VIDEO_%04d.AVI", photoCount);
+    } while (SD_MMC.exists(name) && photoCount < 9999);
+    File f = SD_MMC.open(name, FILE_WRITE);
+    if (!f) { showSimpleError("SD WRITE ERROR"); return; }
+
+    static uint32_t idxOff[VIDEO_MAX_FRAMES], idxLen[VIDEO_MAX_FRAMES];
+    aviWriteHeader(f, 1024, 768, 0, 0, 0, 0, 0);   // placeholders
+
+    const bool anyFx = fxDQT || fxScan || fxChroma || fxZigzag || fxDHT;
+    const unsigned long totalMs = (unsigned long)VIDEO_SECS * 1000UL;
+    uint32_t pos = AVI_HDR_SIZE, frames = 0, maxFrame = 0, dropped = 0;
+    unsigned long t0 = millis(), lastVf = 0, firstMs = 0, lastMs = 0;
+    bool stopped = false, writeErr = false;
+
+    dlog("[VID] rec %s", name + 1);
+    tft.fillScreen(ST77XX_BLACK);
+
+    while (millis() - t0 < totalMs && frames < (uint32_t)VIDEO_MAX_FRAMES) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) { dlog("[VID] no frame"); break; }
+        if (fb->len < 20000) { esp_camera_fb_return(fb); dropped++; continue; }   // parcial
+
+        // VF a taxa reduzida — antes dos glitches (podem deixar o JPEG indecodificável)
+        if (millis() - lastVf >= 250) {
+            if (decodeEighth(fb->buf, fb->len)) {
+                drawVfFrame();
+                unsigned long el = millis() - t0;
+                drawRecOverlay((int)((totalMs - el + 999) / 1000), (int)(el * 100 / totalMs), (el / 500) & 1);
+            }
+            lastVf = millis();
+        }
+
+        if (anyFx) {
+            if (fxZigzag) applyGlitchZigzag(fb->buf, fb->len);
+            if (fxDQT)    applyGlitchDQT(fb->buf, fb->len);
+            if (fxDHT)    applyGlitchDHT(fb->buf, fb->len);
+            if (fxScan)   applyGlitchScan(fb->buf, fb->len);
+            if (fxChroma) applyGlitchChroma(fb->buf, fb->len);
+        }
+
+        uint32_t len = fb->len;
+        idxOff[frames] = pos; idxLen[frames] = len;
+        aviTag(f, "00dc"); aviW32(f, len);
+        size_t wr = f.write(fb->buf, len);
+        if (len & 1) { uint8_t z = 0; f.write(&z, 1); }
+        esp_camera_fb_return(fb);
+        if (wr != len) { writeErr = true; dlog("[VID] sd write fail"); break; }
+
+        pos += 8 + len + (len & 1);
+        if (len > maxFrame) maxFrame = len;
+        if (frames == 0) firstMs = millis();
+        lastMs = millis();
+        frames++;
+
+        if (millis() - t0 > 1000 && digitalRead(BTN_PIN) == LOW) { stopped = true; break; }
+    }
+
+    unsigned long elapsed = (frames > 1) ? (lastMs - firstMs) : 0;
+    uint32_t usPerFrame = (frames > 1) ? (uint32_t)(elapsed * 1000UL / (frames - 1)) : 125000;
+    aviTag(f, "idx1"); aviW32(f, 16 * frames);
+    for (uint32_t i = 0; i < frames; i++) {
+        aviTag(f, "00dc"); aviW32(f, 0x10); aviW32(f, idxOff[i] - AVI_MOVI_TAG); aviW32(f, idxLen[i]);
+    }
+    uint32_t fileSize = pos + 8 + 16 * frames;
+    aviWriteHeader(f, 1024, 768, frames, usPerFrame, maxFrame, 4 + (pos - AVI_HDR_SIZE), fileSize);
+    f.close();
+
+    uint32_t fps10 = elapsed ? (uint32_t)((uint64_t)(frames - 1) * 10000ULL / elapsed) : 0;
+    dlog("[VID] %u frames %u.%u fps %uKB drop %u%s%s", frames, fps10 / 10, fps10 % 10,
+         fileSize / 1024, dropped, stopped ? " stop" : "", writeErr ? " ERR" : "");
+
+    if (frames < 2 || writeErr) {
+        SD_MMC.remove(name);
+        showSimpleError(writeErr ? "SD WRITE ERROR" : "VIDEO: NO FRAMES");
+        while (digitalRead(BTN_PIN) == LOW) delay(10);
+        return;
+    }
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(vfPalettes[vfColorIdx][3]);
+    tft.setCursor(8, 30); tft.print("VIDEO SAVED");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(8, 48); tft.print(name + 1);
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(8, 64); tft.printf("%u frames  %u.%u fps", frames, fps10 / 10, fps10 % 10);
+    tft.setCursor(8, 76); tft.printf("%u KB", fileSize / 1024);
+    tft.setTextColor(0x2965);
+    tft.setCursor(2, 120); tft.print("[BTN] close");
+    while (digitalRead(BTN_PIN) == LOW) delay(10);   // se parou pelo botão, espera soltar
+    delay(120);
+    unsigned long tw = millis();
+    while (millis() - tw < 3000) {
+        if (digitalRead(BTN_PIN) == LOW) { delay(180); break; }
+        delay(10);
+    }
+    while (digitalRead(BTN_PIN) == LOW) delay(10);
+    vfNeedsClear = true;
 }
 
 void takePhoto() {
@@ -2084,7 +2280,7 @@ void handleGallery() {
         while (f && fileCount < 512) {
             const char* n = f.name();
             int len = strlen(n);
-            if (len > 4 && (strcasecmp(n + len - 4, ".JPG") == 0)) {
+            if (len > 4 && (strcasecmp(n + len - 4, ".JPG") == 0 || strcasecmp(n + len - 4, ".AVI") == 0)) {
                 strncpy(fileNames[fileCount], n, 31);
                 fileNames[fileCount][31] = '\0';
                 fileCount++;
@@ -2122,6 +2318,7 @@ void handleGallery() {
         ".card.ram{grid-column:1/-1}"
         ".thumb{width:100%;height:110px;object-fit:cover;display:block;cursor:pointer}"
         ".thumb:active{opacity:.7}"
+        ".thumb.vid{display:flex;align-items:center;justify-content:center;background:#111;color:#f44;font-size:13px;letter-spacing:1px}"
         ".card.ram .thumb{height:160px}"
         ".name{font-size:9px;color:#555;padding:3px 6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
         ".acts{display:flex;gap:3px;padding:4px 6px 6px}"
@@ -2159,18 +2356,33 @@ void handleGallery() {
         char card[640];
         for (int fi = 0; fi < fileCount; fi++) {
             const char* n = fileNames[fi];
-            snprintf(card, sizeof(card),
-                "<div class='card' id='c_%s'>"
-                "<img class='thumb' src='/sd/%s' loading='lazy'"
-                " onclick=\"window.open('/sd/%s')\">"
-                "<div class='name'>%s</div>"
-                "<div class='acts'>"
-                "<a class='ae' href='/editor?file=%s'>edit</a>"
-                "<a class='ab' href='/sd/%s' download>save</a>"
-                "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
-                "</div></div>",
-                n, n, n, n, n, n, n
-            );
+            int nl = strlen(n);
+            bool isAvi = nl > 4 && strcasecmp(n + nl - 4, ".AVI") == 0;
+            if (isAvi) {
+                snprintf(card, sizeof(card),
+                    "<div class='card' id='c_%s'>"
+                    "<div class='thumb vid'>&#9654; VIDEO</div>"
+                    "<div class='name'>%s</div>"
+                    "<div class='acts'>"
+                    "<a class='ab' href='/sd/%s'>save</a>"
+                    "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
+                    "</div></div>",
+                    n, n, n, n
+                );
+            } else {
+                snprintf(card, sizeof(card),
+                    "<div class='card' id='c_%s'>"
+                    "<img class='thumb' src='/sd/%s' loading='lazy'"
+                    " onclick=\"window.open('/sd/%s')\">"
+                    "<div class='name'>%s</div>"
+                    "<div class='acts'>"
+                    "<a class='ae' href='/editor?file=%s'>edit</a>"
+                    "<a class='ab' href='/sd/%s' download>save</a>"
+                    "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
+                    "</div></div>",
+                    n, n, n, n, n, n, n
+                );
+            }
             server.sendContent(card);
         }
     }
@@ -2207,7 +2419,9 @@ void handleSDFile() {
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) { server.send(500, "text/plain", "open error"); return; }
     server.sendHeader("Cache-Control", "max-age=86400, public");
-    server.streamFile(f, "image/jpeg");
+    bool avi = path.endsWith(".AVI") || path.endsWith(".avi");
+    if (avi) server.sendHeader("Content-Disposition", "attachment; filename=" + path.substring(1));
+    server.streamFile(f, avi ? "video/x-msvideo" : "image/jpeg");
     f.close();
 }
 
@@ -2395,7 +2609,8 @@ void setup() {
             if (!f.isDirectory()) {
                 const char* name = f.name();
                 int n = 0;
-                if (sscanf(name, "/PHOTO_%d.JPG", &n) == 1 || sscanf(name, "PHOTO_%d.JPG", &n) == 1)
+                if (sscanf(name, "/PHOTO_%d.JPG", &n) == 1 || sscanf(name, "PHOTO_%d.JPG", &n) == 1 ||
+                    sscanf(name, "/VIDEO_%d.AVI", &n) == 1 || sscanf(name, "VIDEO_%d.AVI", &n) == 1)
                     if (n > photoCount) photoCount = n;
             }
             f = root.openNextFile();
@@ -2594,7 +2809,7 @@ void connectSTA() {
     drawWiFiMenu();
 }
 
-const char* MENU_ITEMS[] = { "VF COLOR", "LONG EXP", "TIMER", "EFFECTS", "WIFI", "FORMAT SD CARD", "EXIT" };
+const char* MENU_ITEMS[] = { "VF COLOR", "LONG EXP", "TIMER", "EFFECTS", "WIFI", "FORMAT SD CARD", "MODE" };
 const int   MENU_N       = 7;
 
 void drawMenu() {
@@ -2639,6 +2854,10 @@ void drawMenu() {
             if (wifiSetup || !wifiOK) snprintf(lb, sizeof(lb), "WIFI: setup");
             else if (wifiAP)          snprintf(lb, sizeof(lb), "WIFI: AP");
             else                      snprintf(lb, sizeof(lb), "WIFI: %s", WiFi.localIP().toString().c_str());
+            tft.print(lb);
+        } else if (i == 6) {
+            char lb[22];
+            snprintf(lb, sizeof(lb), videoMode ? "MODE: VIDEO %dS" : "MODE: PHOTO", VIDEO_SECS);
             tft.print(lb);
         } else {
             tft.print(MENU_ITEMS[i]);
@@ -2809,7 +3028,7 @@ void handleButton() {
     if (btn == HIGH && lastBtn == LOW && !longHandled && (millis() - pressTime > 30)) {
         if (appState == STATE_VF) {
             if (timerSecs > 0) runCountdown();
-            takePhoto();
+            if (videoMode) recordVideo(); else takePhoto();
         } else if (appState == STATE_MENU) {
             if (menuSel == 0) {
                 appState = STATE_VF_COLOR;
@@ -2840,8 +3059,9 @@ void handleButton() {
                 confirmSel = 1;
                 appState   = STATE_CONFIRM;
                 drawConfirmFormat();
-            } else {
-                appState = STATE_VF; vfNeedsClear = true;
+            } else if (menuSel == 6) {
+                videoMode = !videoMode;
+                drawMenu();
             }
         } else if (appState == STATE_WIFI) {
             switch (wifiMenuSel) {
@@ -3047,13 +3267,7 @@ void loop() {
     int  aeLuma = doAE ? measureLuma(decBuf, DEC_W, DEC_H) : 0;
     if (doAE) vfLastLuma = aeLuma;
 
-    toGreenTones(decBuf, DEC_W, DEC_H);
-    upscaleToVf();
-
-    tft.startWrite();
-    tft.setAddrWindow(0, (128 - VF_H) / 2, VF_W, VF_H);
-    tft.writePixels((uint16_t*)vfBuf, VF_W * VF_H, true, true);
-    tft.endWrite();
+    drawVfFrame();
 
     if (doAE) autoExposure(aeLuma);
 
