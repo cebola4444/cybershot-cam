@@ -510,6 +510,8 @@ void handleSDFile();
 void handleSaveEdit();
 void handleSaveEditUpload();
 void handleLog();
+void handlePresets();
+void handlePreset();
 
 void setupWebServer();   // forward declaration
 
@@ -696,6 +698,8 @@ void setupWebServer() {
     server.on("/delete",    handleDelete);
     server.on("/save-edit", HTTP_POST, handleSaveEdit, handleSaveEditUpload);
     server.on("/log",       handleLog);
+    server.on("/presets",   handlePresets);
+    server.on("/preset",    handlePreset);
     server.onNotFound(handleSDFile);
     server.begin();
     IPAddress ip = wifiAP ? WiFi.softAPIP() : WiFi.localIP();
@@ -1539,6 +1543,12 @@ void recordVideo() {
         }
 
         uint32_t len = fb->len;
+        if (frames == 0) {   // miniatura para a galeria: 1º frame como JPEG (.THM)
+            char tn[32];
+            snprintf(tn, sizeof(tn), "/VIDEO_%04d.THM", photoCount);
+            File t = SD_MMC.open(tn, FILE_WRITE);
+            if (t) { t.write(fb->buf, len); t.close(); }
+        }
         idxOff[frames] = pos; idxLen[frames] = len;
         aviTag(f, "00dc"); aviW32(f, len);
         size_t wr = f.write(fb->buf, len);
@@ -1734,6 +1744,8 @@ void handleEditor() {
         ".divider{height:1px;background:#161616;margin:8px 0}"
         ".vid button{color:#f80;border-color:#f80}"
         ".vid button.on{background:#f80;color:#000}"
+        ".pre button{color:#9f6;border-color:#9f6}"
+        "select{flex:2;min-width:0;background:#141414;color:#ddd;border:1px solid #2a2a2a;border-radius:3px;padding:6px;font-family:monospace;font-size:11px}"
         "[hidden]{display:none!important}"
         "</style></head><body>"
     );
@@ -1773,6 +1785,10 @@ void handleEditor() {
         "<div class='btns vid'><button id='bGif'>export GIF</button><button id='bVid'>export video</button></div>"
         "</div>"
 
+        "<div class='sec'>preset</div>"
+        "<div class='btns pre'><select id='selPre'></select><button id='bPreLoad'>load</button></div>"
+        "<div class='btns pre'><button id='bPreSave'>save as...</button><button id='bPreDel'>delete</button></div>"
+
         "<div class='sec'>adjust</div>"
         "<div class='row'><label>brightness</label><input type='range' id='sBri' min='-100' max='100' value='0'><span class='val' id='vBri'>0</span></div>"
         "<div class='row'><label>contrast</label><input type='range' id='sCon' min='-100' max='100' value='0'><span class='val' id='vCon'>0</span></div>"
@@ -1783,6 +1799,9 @@ void handleEditor() {
         "<div class='row'><label>fade</label><input type='range' id='sFade' min='0' max='100' value='0'><span class='val' id='vFade'>0</span></div>"
         "<div class='row'><label>vignette</label><input type='range' id='sVig' min='0' max='100' value='0'><span class='val' id='vVig'>0</span></div>"
         "<div class='row'><label>chroma ab.</label><input type='range' id='sCA' min='0' max='20' value='0'><span class='val' id='vCA'>0</span></div>"
+        "<div class='row'><label>red</label><input type='range' id='sR' min='-100' max='100' value='0'><span class='val' id='vR'>0</span></div>"
+        "<div class='row'><label>green</label><input type='range' id='sG' min='-100' max='100' value='0'><span class='val' id='vG'>0</span></div>"
+        "<div class='row'><label>blue</label><input type='range' id='sB' min='-100' max='100' value='0'><span class='val' id='vB'>0</span></div>"
 
         "<div class='sec'>crop</div>"
         "<div class='btns crp'>"
@@ -1900,10 +1919,12 @@ void handleEditor() {
           "const sh=+document.getElementById('sSha').value;"
           "const hi=+document.getElementById('sHil').value;"
           "const fd=+document.getElementById('sFade').value/100;"
+          "const gR=1+(+document.getElementById('sR').value)/100,gG=1+(+document.getElementById('sG').value)/100,gB=1+(+document.getElementById('sB').value)/100;"
           "const cf=259*(co+255)/(255*(259-co)),sm=1+sa/100;"
           "for(let i=0;i<px.length;i+=4){"
             "let r=px[i],g=px[i+1],b=px[i+2];"
             "r+=br;g+=br;b+=br;"
+            "r*=gR;g*=gG;b*=gB;"
             "r=cf*(r-128)+128;g=cf*(g-128)+128;b=cf*(b-128)+128;"
             "const gr=0.299*r+0.587*g+0.114*b;"
             "r=gr+(r-gr)*sm;g=gr+(g-gr)*sm;b=gr+(b-gr)*sm;"
@@ -2064,6 +2085,7 @@ void handleEditor() {
         "wire('sBri','vBri');wire('sCon','vCon');wire('sSat','vSat');"
         "wire('sSha','vSha');wire('sHil','vHil');wire('sTemp','vTemp');wire('sFade','vFade');"
         "wire('sVig','vVig');wire('sCA','vCA');"
+        "wire('sR','vR');wire('sG','vG');wire('sB','vB');"
         "wire('sPsMin','vPsMin');wire('sPsMax','vPsMax');"
         "wire('sEBsz','vEBsz');wire('sELvl','vELvl');"
         "wire('sAcSz','vAcSz');"
@@ -2178,8 +2200,8 @@ void handleEditor() {
           "setRatio('bCrOrig',null);};"
 
         "document.getElementById('bReset').onclick=()=>{"
-          "['sBri','sCon','sSat','sSha','sHil','sTemp','sFade','sVig','sCA'].forEach(s=>document.getElementById(s).value=0);"
-          "['vBri','vCon','vSat','vSha','vHil','vTemp','vFade','vVig','vCA'].forEach(v=>document.getElementById(v).textContent=0);"
+          "['sBri','sCon','sSat','sSha','sHil','sTemp','sFade','sVig','sCA','sR','sG','sB'].forEach(s=>document.getElementById(s).value=0);"
+          "['vBri','vCon','vSat','vSha','vHil','vTemp','vFade','vVig','vCA','vR','vG','vB'].forEach(v=>document.getElementById(v).textContent=0);"
           "['sPsMin','sPsMax'].forEach(s=>document.getElementById(s).value=s==='sPsMin'?20:80);"
           "document.getElementById('vPsMin').textContent=20;document.getElementById('vPsMax').textContent=80;"
           "filt=null;rot=0;flipH=false;psOn=false;psDir='h';psKey='luma';eightOn=false;cropRatio=null;vidCrop=null;asciiOn=false;asciiCs=0;asciiCol='mono';"
@@ -2292,6 +2314,24 @@ async function exportVideo(){const mime=['video/mp4','video/webm;codecs=vp9','vi
  const blob=new Blob(chunks,{type:mime});const ext=mime.indexOf('mp4')>=0?'mp4':'webm';st('video '+Math.round(blob.size/1024)+' KB');
  await deliver(blob,'cybershot.'+ext);await showFrame(vidIdx);}
 $('bGif').onclick=()=>{exportGif();};$('bVid').onclick=()=>{exportVideo();};
+const PRE_SL=['sBri','sCon','sSat','sSha','sHil','sTemp','sFade','sVig','sCA','sR','sG','sB','sPsMin','sPsMax','sEBsz','sELvl','sAcSz'];
+function preGet(){const v={};PRE_SL.forEach(id=>v[id]=+$(id).value);return{v,filt,rot,flipH,psOn,psDir,psKey,eightOn,asciiOn,asciiCs,asciiCol};}
+function preApply(p){const v=p.v||{};for(const id in v){const e=$(id);if(!e)continue;e.value=v[id];const l=$('v'+id.slice(1));if(l)l.textContent=v[id];}
+ filt=p.filt||null;const fm={gray:'bGray',sepia:'bSepia',invert:'bInvert',noir:'bNoir'};Object.values(fm).forEach(id=>$(id).classList.remove('on'));if(filt&&fm[filt])$(fm[filt]).classList.add('on');
+ rot=(p.rot|0)&3;flipH=!!p.flipH;$('bFlip').classList.toggle('on',flipH);
+ psOn=!!p.psOn;$('bPxSort').classList.toggle('on',psOn);$('bPxSort').innerHTML=psOn?'&#8801; sort: on':'&#8801; sort: off';setPsDir(p.psDir||'h');setPsKey(p.psKey||'luma');
+ eightOn=!!p.eightOn;$('bEight').classList.toggle('on',eightOn);$('bEight').innerHTML=eightOn?'&#9632; 8bit: on':'&#9632; 8bit: off';
+ asciiOn=!!p.asciiOn;$('bAscii').classList.toggle('on',asciiOn);$('bAscii').innerHTML=asciiOn?'Aa ascii: on':'Aa ascii: off';setAsciiCs((p.asciiCs|0)&3);setAsciiCol(p.asciiCol||'mono');
+ render();}
+async function preList(){try{const r=await fetch('/presets');const t=r.ok?await r.text():'';const s=$('selPre');s.innerHTML='';
+ t.split('\n').filter(x=>x).forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;s.appendChild(o);});
+ if(!s.options.length){const o=document.createElement('option');o.value='';o.textContent='(no presets)';s.appendChild(o);}}catch(e){}}
+$('bPreSave').onclick=async()=>{const n=prompt('nome do preset (letras, numeros, _ -)');if(!n)return;
+ try{const r=await fetch('/preset?name='+encodeURIComponent(n),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(preGet())});
+ st(r.ok?'preset salvo no SD':'erro ao salvar preset');}catch(e){st('erro ao salvar preset');}preList();};
+$('bPreLoad').onclick=async()=>{const n=$('selPre').value;if(!n)return;try{const r=await fetch('/preset?name='+encodeURIComponent(n));if(!r.ok)throw 0;preApply(await r.json());st('preset: '+n);}catch(e){st('erro ao carregar preset');}};
+$('bPreDel').onclick=async()=>{const n=$('selPre').value;if(!n||!confirm('apagar preset '+n+'?'))return;await fetch('/preset?name='+encodeURIComponent(n)+'&del=1');preList();};
+preList();
 if(isVideo)loadAvi();
 )JS";
     server.sendContent(_v, sizeof(_v)-1);}
@@ -2349,6 +2389,67 @@ void handleSaveEdit() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Presets do editor: JSON no SD em /PRESETS/<NOME>.JSON ───────────────────
+// Ficam no cartão (não no navegador) para valerem em qualquer aparelho e em AP/STA.
+
+static bool presetPath(char* out, size_t n) {
+    String name = server.arg("name");
+    char clean[24]; int k = 0;
+    for (size_t i = 0; i < name.length() && k < 20; i++) {
+        char ch = name[i];
+        if (isalnum((unsigned char)ch) || ch == '_' || ch == '-') clean[k++] = toupper((unsigned char)ch);
+    }
+    clean[k] = '\0';
+    if (k == 0) return false;
+    snprintf(out, n, "/PRESETS/%s.JSON", clean);
+    return true;
+}
+
+void handlePresets() {
+    if (!sdOK) { server.send(503, "text/plain", "no sd"); return; }
+    String out;
+    File dir = SD_MMC.open("/PRESETS");
+    if (dir && dir.isDirectory()) {
+        File f = dir.openNextFile();
+        while (f) {
+            if (!f.isDirectory()) {
+                String fn = f.name();
+                int slash = fn.lastIndexOf('/');
+                if (slash >= 0) fn = fn.substring(slash + 1);
+                if (fn.endsWith(".JSON")) { out += fn.substring(0, fn.length() - 5); out += '\n'; }
+            }
+            f = dir.openNextFile();
+        }
+    }
+    server.send(200, "text/plain", out);
+}
+
+void handlePreset() {
+    if (!sdOK) { server.send(503, "text/plain", "no sd"); return; }
+    char path[40];
+    if (!presetPath(path, sizeof(path))) { server.send(400, "text/plain", "bad name"); return; }
+    if (server.method() == HTTP_POST) {
+        String body = server.arg("plain");
+        if (body.length() == 0 || body.length() > 4096) { server.send(400, "text/plain", "bad body"); return; }
+        if (!SD_MMC.exists("/PRESETS")) SD_MMC.mkdir("/PRESETS");
+        File f = SD_MMC.open(path, FILE_WRITE);
+        if (!f) { server.send(500, "text/plain", "write error"); return; }
+        f.print(body);
+        f.close();
+        server.send(200, "text/plain", "ok");
+        return;
+    }
+    if (server.hasArg("del")) {
+        SD_MMC.remove(path);
+        server.send(200, "text/plain", "ok");
+        return;
+    }
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) { server.send(404, "text/plain", "not found"); return; }
+    server.streamFile(f, "application/json");
+    f.close();
+}
 
 void handleLog() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -2439,7 +2540,7 @@ void handleGallery() {
         ".card.ram{grid-column:1/-1}"
         ".thumb{width:100%;height:110px;object-fit:cover;display:block;cursor:pointer}"
         ".thumb:active{opacity:.7}"
-        ".thumb.vid{display:flex;align-items:center;justify-content:center;background:#111;color:#f44;font-size:13px;letter-spacing:1px}"
+        ".thumb.vid{display:flex;align-items:center;justify-content:center;background:#111 center/cover no-repeat;color:#f44;font-size:22px;text-shadow:0 0 8px #000,0 0 3px #000}"
         ".card.ram .thumb{height:160px}"
         ".name{font-size:9px;color:#555;padding:3px 6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
         ".acts{display:flex;gap:3px;padding:4px 6px 6px}"
@@ -2485,14 +2586,14 @@ void handleGallery() {
             if (isAvi) {
                 snprintf(card, sizeof(card),
                     "<div class='card' id='c_%s'>"
-                    "<div class='thumb vid'>&#9654; VIDEO</div>"
+                    "<div class='thumb vid' style=\"background-image:url('/sd/%.*s.THM')\">&#9654;</div>"
                     "<div class='name'>%s</div>"
                     "<div class='acts'>"
                     "<a class='ae' href='/editor?file=%s'>edit</a>"
                     "<a class='ab' href='/sd/%s'>save</a>"
                     "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
                     "</div></div>",
-                    n, n, n, n, n
+                    n, nl - 4, n, n, n, n, n
                 );
             } else if (isVid) {
                 snprintf(card, sizeof(card),
@@ -2556,6 +2657,11 @@ void handleDelete() {
     String path = "/" + file;
     if (!SD_MMC.exists(path)) { server.send(404, "text/plain", "not found"); return; }
     SD_MMC.remove(path);
+    String up = path; up.toUpperCase();
+    if (up.endsWith(".AVI")) {   // miniatura do vídeo vai junto
+        String thm = path.substring(0, path.length() - 4) + ".THM";
+        if (SD_MMC.exists(thm)) SD_MMC.remove(thm);
+    }
     server.send(200, "text/plain", "ok");
 }
 
