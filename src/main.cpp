@@ -483,13 +483,9 @@ void drawViewfinderOverlay() {
     // barra de EV — desenhada aqui para garantir que fica por cima do frame
     if (evComp != 0) drawEvBar();
 
-    static bool _wifi = false;
-    static bool _ap   = false;
-    if (wifiOK == _wifi && wifiAP == _ap) return;
-    _wifi = wifiOK;
-    _ap   = wifiAP;
+    // redesenhado a cada frame (o frame do VF cobre até y=123 e apagaria um desenho único)
     tft.setTextSize(1);
-    tft.setCursor(118, 120);
+    tft.setCursor(134, 114);
     if (!wifiOK) {
         tft.setTextColor(ST77XX_RED);   tft.print("----");
     } else if (wifiAP) {
