@@ -268,14 +268,23 @@ static bool logGet(int i, char* out) {
 
 // ─── Câmera ───────────────────────────────────────────────────────────────────
 
-// Desenho em que o sensor nunca travou em semanas de uso: viewfinder em RGB565 QQVGA
-// (modo CIF, 10 MHz — frio) e foto em JPEG (soft-reset + XGA, 20 MHz) por ~1 s.
-// O ponto fraco é o reinit no ESP32-S3: o driver exige o marcador SOI no byte 0 do 1º
-// bloco DMA e descarta frames JPEG desalinhados em silêncio → init "ok" sem frames.
-// Mitigação: checar VSYNC vivo (sensor gerando frames) e refazer o init quando o 1º
-// frame não chega, em vez de esperar 8 s e desistir.
-static const framesize_t VF_SIZE  = FRAMESIZE_QQVGA;   // 160×120
+// O sensor é configurado UMA vez no boot (JPEG XGA) e nunca mais é resetado ou
+// reconfigurado: log 2026-09-11 — após esp_camera_deinit/init (soft-reset) o OV2640
+// aceita toda a programação via SCCB mas não gera VSYNC (2 de 9 reinit entregaram
+// frames). Viewfinder e foto usam o MESMO frame XGA: o VF decodifica a 1/8 (128×96,
+// só DC — rápido) e amplia para 160×120; a foto é o próximo frame. Únicas escritas no
+// sensor em operação: aec/ganho (AE, EV) e AE auto on/off (long exposure).
 static const framesize_t CAP_SIZE = FRAMESIZE_XGA;     // 1024×768
+
+// Exposição manual do VF/foto (também desliga o AE automático deixado pela long exposure).
+static void camApplyVfExposure() {
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return;
+    s->set_exposure_ctrl(s, 0);
+    s->set_gain_ctrl(s, 0);
+    s->set_aec_value(s, vfAecValue);
+    s->set_agc_gain(s, vfAgcGain);
+}
 
 // true se o pino VSYNC mudou de nível dentro de `ms` (sensor está gerando frames).
 // No S3 o driver lê VSYNC pelo periférico LCD_CAM, não por interrupção de GPIO — ler o
@@ -344,7 +353,7 @@ static void sccbBusRecover() {
     sccbBusInit();
 }
 
-bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
+bool initCamera() {
     esp_camera_deinit();
     delay(50);
     sccbBusInit();
@@ -370,25 +379,24 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
-    // VF em 10 MHz (calibração de exposição do VF); foto em 20 MHz — o único caminho de
-    // reinit que entregou frames de forma consistente (a 10 MHz o 1º frame JPEG após a
-    // troca de modo demorou/não veio). O driver faz soft-reset a cada init.
-    cfg.xclk_freq_hz = (fmt == PIXFORMAT_JPEG) ? 20000000 : 10000000;
+    // 10 MHz: em XGA (modo UXGA do sensor) aec 1200 ≈ 1/8 s e ~8 fps — foi o que rodou
+    // estável (VF 9 fps, fotos iguais ao VF) no build de XGA fixo.
+    cfg.xclk_freq_hz = 10000000;
 
-    cfg.pixel_format = fmt;
-    // JPEG: o driver dimensiona o frame buffer por w*h/5 do frame_size do init. XGA daria
+    cfg.pixel_format = PIXFORMAT_JPEG;
+    // O driver dimensiona o frame buffer JPEG por w*h/5 do frame_size do init. XGA daria
     // ~154 KB e estoura com ruído de ganho alto (frame descartado, sem EOI). Inicia em UXGA
-    // (~375 KB) e reduz para o tamanho pedido com set_framesize.
-    cfg.frame_size   = (fmt == PIXFORMAT_JPEG) ? FRAMESIZE_UXGA : size;
-    cfg.jpeg_quality = quality;
-    cfg.fb_count     = fbCount;
+    // (~375 KB × 2) e reduz para XGA com set_framesize — uma única vez, aqui.
+    cfg.frame_size   = FRAMESIZE_UXGA;
+    cfg.jpeg_quality = 12;
+    cfg.fb_count     = 2;
     cfg.grab_mode    = CAMERA_GRAB_LATEST;
     cfg.fb_location  = CAMERA_FB_IN_PSRAM;
 
     unsigned long t0 = millis();
     esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
-        dlog("[CAM] init fail 0x%x %s", err, fmt == PIXFORMAT_JPEG ? "JPEG" : "RGB");
+        dlog("[CAM] init fail 0x%x", err);
         sccbBusRecover();
         delay(300);
         err = esp_camera_init(&cfg);
@@ -401,29 +409,17 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
 
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
-        if (fmt == PIXFORMAT_JPEG && size != FRAMESIZE_UXGA) {
-            s->set_framesize(s, size);
-            delay(100);
-        }
+        s->set_framesize(s, CAP_SIZE);   // única troca de resolução: aqui, logo após o soft-reset
+        delay(150);
         s->set_hmirror(s, 1);
         s->set_brightness(s, 1);
         s->set_gainceiling(s, GAINCEILING_128X);
-        s->set_exposure_ctrl(s, 0);  // exposição manual — controlada pelo código
-        s->set_gain_ctrl(s, 0);
-
-        if (fmt == PIXFORMAT_RGB565) {
-            s->set_whitebal(s, 0);
-            s->set_aec_value(s, vfAecValue);
-            s->set_agc_gain(s, vfAgcGain);
-        } else {
-            s->set_whitebal(s, 1);    // AWB ligado — corrige dominância de cor
-            s->set_awb_gain(s, 1);
-            s->set_wb_mode(s, 0);
-            s->set_aec_value(s, min(1200, vfAecValue * 2));   // XCLK 2× → aec 2×; a medição refina
-            s->set_agc_gain(s, vfAgcGain);
-        }
+        s->set_whitebal(s, 1);    // AWB sempre ligado: o VF só usa luma, a foto precisa
+        s->set_awb_gain(s, 1);
+        s->set_wb_mode(s, 0);
     }
-    dlog("[CAM] init %s ok %lums", fmt == PIXFORMAT_JPEG ? "JPEG" : "RGB", millis() - t0);
+    camApplyVfExposure();
+    dlog("[CAM] init ok %lums", millis() - t0);
     return true;
 }
 
@@ -1104,13 +1100,11 @@ static void showDiagScreen(const char* title) {
     }
 }
 
-// Volta ao viewfinder (RGB565 QQVGA) após foto/erro, com uma segunda tentativa.
+// Volta ao viewfinder após foto/erro. Só escreve no sensor se a long exposure deixou o AE
+// automático ligado — fora isso, zero tráfego SCCB depois da foto.
+static bool camAeAuto = false;
 static void restoreViewfinder() {
-    delay(100);
-    if (!initCamera(PIXFORMAT_RGB565, VF_SIZE, 12, 2)) {
-        delay(500);
-        initCamera(PIXFORMAT_RGB565, VF_SIZE, 12, 2);
-    }
+    if (camAeAuto) { camApplyVfExposure(); camAeAuto = false; }
     vfNeedsClear = true;
 }
 
@@ -1200,6 +1194,20 @@ static int photoLuma(uint8_t* jpg, size_t len) {
     return decodeEighth(jpg, len) ? measureLuma(decBuf, DEC_W, DEC_H) : -1;
 }
 
+// VF: 128×96 (decBuf) → 160×120 (vfBuf), vizinho mais próximo 4:5. Copia em uint16 —
+// mantém os bytes big-endian que toGreenTones/writePixels esperam.
+static const int VF_W = 160, VF_H = 120;
+static uint8_t*  vfBuf = nullptr;
+static void upscaleToVf() {
+    const uint16_t* src = (const uint16_t*)decBuf;
+    uint16_t*       dst = (uint16_t*)vfBuf;
+    for (int y = 0; y < VF_H; y++) {
+        const uint16_t* srow = src + (y * DEC_H / VF_H) * DEC_W;
+        uint16_t*       drow = dst + y * VF_W;
+        for (int x = 0; x < VF_W; x++) drow[x] = srow[x * DEC_W / VF_W];
+    }
+}
+
 // Próximo frame XGA completo (≥ 20 KB; frames QQVGA antigos na fila são menores). NULL = nada.
 static camera_fb_t* camNextXgaFrame() {
     for (int i = 0; i < 6; i++) {
@@ -1212,49 +1220,12 @@ static camera_fb_t* camNextXgaFrame() {
     return nullptr;
 }
 
-// Init JPEG para a foto com verificação: sensor gerando VSYNC e o 1º frame chegando de
-// fato (o driver descarta frames JPEG com SOI desalinhado sem avisar). Até 2 tentativas.
-static bool initJpegForCapture(uint8_t fbCount) {
-    for (int t = 1; t <= 2; t++) {
-        if (t > 1) delay(300);
-        if (!initCamera(PIXFORMAT_JPEG, CAP_SIZE, 12, fbCount)) continue;
-        bool vs = camVsyncAlive(1000);   // só informativo: o teste real é o frame chegar
-        unsigned long tw = millis();
-        camera_fb_t* w = esp_camera_fb_get();
-        dlog("[CAP] t%d vsync %d w0 %s %uB %lums", t, vs, w ? "ok" : "NULL",
-             w ? (unsigned)w->len : 0, millis() - tw);
-        if (w) { esp_camera_fb_return(w); return true; }
-    }
-    return false;
-}
-
-// Foto: init JPEG XGA e MEDE a luma do frame (decode a 1/8) para corrigir aec/ganho antes
-// de capturar — o chute inicial é a calibração antiga (aec ×2); medir refina. Até 3
-// iterações; devolve o frame da última medição.
+// Foto: o sensor já está em XGA com a exposição do VF — descarta 2 frames (fila GRAB_LATEST
+// de 2 + frame em andamento podem ser de antes do flash) e devolve o próximo completo.
 static camera_fb_t* grabCaptureFrame(const char* label, int pct) {
     drawCaptureStatus(label, pct);
-    if (!initJpegForCapture(1)) return nullptr;
-    int aec = min(1200, vfAecValue * 2), gain = vfAgcGain;
-    int target = aeTarget();
-    for (int it = 0; it < 3; it++) {
-        camDropFrames(1);   // latência do sensor ao aplicar aec/gain
-        camera_fb_t* fb = camNextXgaFrame();
-        if (!fb) return nullptr;
-        int luma = decodeEighth(fb->buf, fb->len) ? measureLuma(decBuf, DEC_W, DEC_H) : -1;
-        dlog("[CAP] it%d aec %d g %d luma %d alvo %d %uB", it, aec, gain, luma, target, (unsigned)fb->len);
-        if (luma < 0 || it == 2 || abs(luma - target) <= target * 3 / 10) return fb;
-        esp_camera_fb_return(fb);
-
-        // razão até o alvo → exposição primeiro (até 1200 linhas), resto em ganho (5 un. ≈ 1 stop)
-        float ratio = constrain((float)target / (float)max(luma, 50), 0.125f, 8.0f);
-        float aecF  = aec * ratio;
-        int newAec  = (int)constrain(aecF, 4.0f, 1200.0f);
-        int newGain = constrain(gain + (int)lroundf(5.0f * log2f(aecF / newAec)), 0, 30);
-        aec = newAec; gain = newGain;
-        sensor_t* s = esp_camera_sensor_get();
-        if (s) { s->set_aec_value(s, aec); s->set_agc_gain(s, gain); }
-    }
-    return nullptr;
+    camDropFrames(2);
+    return camNextXgaFrame();
 }
 
 // ─── Long exposure: stacking de frames ──────────────────────────────────────
@@ -1288,12 +1259,7 @@ void takeLongExposureStacked() {
     tft.fillScreen(gbPalette[0]);
     drawCaptureStatus("SETTLING...", 3);
 
-    // JPEG XGA (2 buffers); acumuladores uint16_t = 4.5MB (cabe nos 8MB PSRAM)
-    if (!initJpegForCapture(2)) {
-        showDiagScreen("JPEG CAMERA ERROR");
-        restoreViewfinder();
-        return;
-    }
+    // sensor já em XGA; acumuladores uint16_t = 4.5MB (cabe nos 8MB PSRAM)
 
     // Começa com exposição máxima, habilita AE auto — converge de cima pra baixo (rápido)
     {
@@ -1303,6 +1269,7 @@ void takeLongExposureStacked() {
             s->set_agc_gain(s, 30);
             s->set_exposure_ctrl(s, 1);
             s->set_gain_ctrl(s, 1);
+            camAeAuto = true;   // restoreViewfinder volta para manual
         }
     }
 
@@ -2470,7 +2437,8 @@ void setup() {
     tft.setTextColor(0x7BEF);
     tft.setCursor(8, 38); tft.print("CAM  ...");
     if (!decBuf) decBuf = (uint8_t*)ps_malloc(DEC_W * DEC_H * 2);
-    if (!decBuf || !initCamera(PIXFORMAT_RGB565, VF_SIZE, 12, 2)) {
+    if (!vfBuf)  vfBuf  = (uint8_t*)ps_malloc(VF_W * VF_H * 2);
+    if (!decBuf || !vfBuf || !initCamera()) {
         tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
         tft.setTextColor(ST77XX_RED);
         tft.setCursor(8, 38); tft.print("CAM  FAIL");
@@ -3087,36 +3055,29 @@ void loop() {
     unsigned long tf = millis();
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
-        // sem frame = câmera parada. Uma tentativa de reinit; se o sensor não responde
-        // (probe falha) ou segue sem frames, reinicia o ESP — o boot completo sempre volta.
-        vfFailCount++;
-        dlog("[VF] no frame %lums (#%d)", millis() - tf, vfFailCount);
-        if (vfFailCount >= 2 || !initCamera(PIXFORMAT_RGB565, VF_SIZE, 12, 2)) {
-            dlog("[VF] restart"); delay(100); ESP.restart();
-        }
-        delay(5);
-        return;
+        // sem frame = sensor parado. Reinit não recupera (soft-reset não volta); o boot
+        // completo (reset do chip, segundos sem XCLK) sempre volta.
+        dlog("[VF] no frame %lums -> restart", millis() - tf);
+        delay(100);
+        ESP.restart();
     }
-    vfFailCount = 0;
 
-    // mede luma antes de processar — SCCB só depois do fb_return
-    bool doAE = (++vfFrameCnt % 10 == 0);
-    int  aeLuma = doAE ? measureLuma(fb->buf, fb->width, fb->height) : 0;
+    bool decoded = decodeEighth(fb->buf, fb->len);
+    esp_camera_fb_return(fb);   // devolve o buffer antes de qualquer chamada SCCB
+    if (!decoded) { delay(1); return; }   // frame parcial/corrompido
+
+    // ~8 fps → AE a cada 5 frames ≈ 1,6×/s (sensor aplica aec/gain em 1–2 frames)
+    bool doAE = (++vfFrameCnt % 5 == 0);
+    int  aeLuma = doAE ? measureLuma(decBuf, DEC_W, DEC_H) : 0;
     if (doAE) vfLastLuma = aeLuma;
 
-    toGreenTones(fb->buf, fb->width, fb->height);
-
-    int vfW = min((int)fb->width,  160);
-    int vfH = min((int)fb->height, 128);
-    int vfX = (160 - vfW) / 2;
-    int vfY = (128 - vfH) / 2;
+    toGreenTones(decBuf, DEC_W, DEC_H);
+    upscaleToVf();
 
     tft.startWrite();
-    tft.setAddrWindow(vfX, vfY, vfW, vfH);
-    tft.writePixels((uint16_t*)fb->buf, vfW * vfH, true, true);
+    tft.setAddrWindow(0, (128 - VF_H) / 2, VF_W, VF_H);
+    tft.writePixels((uint16_t*)vfBuf, VF_W * VF_H, true, true);
     tft.endWrite();
-
-    esp_camera_fb_return(fb);   // libera o buffer antes de qualquer chamada SCCB
 
     if (doAE) autoExposure(aeLuma);
 
