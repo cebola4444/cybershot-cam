@@ -31,7 +31,6 @@
 #include "img_converters.h"
 #include "SD_MMC.h"
 #include "esp_log.h"
-#include "driver/i2c.h"
 
 DNSServer    dnsServer;
 Preferences  wifiPrefs;
@@ -310,32 +309,12 @@ static void camDropFrames(int n) {
     }
 }
 
-// ─── Barramento SCCB próprio ─────────────────────────────────────────────────
-// O driver da câmera usa I2C a 100 kHz com os pull-ups internos do ESP32 (~45 kΩ): bordas
-// lentas, margem apertada — uma transação corrompida pode cair num registrador crítico e
-// travar o OV2640 (os travamentos no log coincidem com escritas de exposição). Barramento
-// próprio a 50 kHz, persistente entre deinit/init (o driver não o destrói), com recuperação
-// por pulsos quando o probe falha.
-static bool sccbBusReady = false;
-
-static void sccbBusInit() {
-    if (sccbBusReady) return;
-    i2c_config_t c = {};
-    c.mode             = I2C_MODE_MASTER;
-    c.sda_io_num       = SIOD_GPIO_NUM;
-    c.scl_io_num       = SIOC_GPIO_NUM;
-    c.sda_pullup_en    = GPIO_PULLUP_ENABLE;
-    c.scl_pullup_en    = GPIO_PULLUP_ENABLE;
-    c.master.clk_speed = 50000;
-    esp_err_t e = i2c_param_config(I2C_NUM_0, &c);
-    if (e == ESP_OK) e = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-    sccbBusReady = (e == ESP_OK);
-    if (!sccbBusReady) dlog("[SCCB] bus init fail 0x%x", e);
-}
-
-// Recuperação I2C (spec): 9 pulsos de SCL + STOP com os pinos em GPIO; depois reinstala.
+// SCCB: fica com o barramento do próprio driver (100 kHz). Um barramento criado pelo
+// firmware a 50 kHz e entregue via sccb_i2c_port foi testado em 11/09 e quebrou o modo
+// JPEG (sensor sem VSYNC após o init) — não repetir.
+// Recuperação I2C (spec): 9 pulsos de SCL + STOP com os pinos em GPIO. Só é chamada quando
+// o init falhou (o driver já liberou os pinos); o retry reinstala o SCCB do driver.
 static void sccbBusRecover() {
-    if (sccbBusReady) { i2c_driver_delete(I2C_NUM_0); sccbBusReady = false; }
     const gpio_num_t scl = (gpio_num_t)SIOC_GPIO_NUM;
     const gpio_num_t sda = (gpio_num_t)SIOD_GPIO_NUM;
     gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
@@ -350,17 +329,11 @@ static void sccbBusRecover() {
     gpio_set_level(sda, 0); delayMicroseconds(10);   // STOP: SDA↓ com SCL↑, depois SDA↑
     gpio_set_level(sda, 1); delayMicroseconds(10);
     dlog("[SCCB] bus recover");
-    sccbBusInit();
 }
-
-// Barramento SCCB: 0 = o próprio driver (100 kHz, como no build que rodou de manhã);
-// 1 = barramento próprio a 50 kHz (sccbBusInit). Teste A/B — 3 falhas em JPEG com o próprio.
-#define SCCB_OWN_BUS 0
 
 bool initCamera() {
     esp_camera_deinit();
     delay(50);
-    if (SCCB_OWN_BUS) sccbBusInit();
 
     camera_config_t cfg = {};
     cfg.ledc_channel  = LEDC_CHANNEL_0;
@@ -377,9 +350,8 @@ bool initCamera() {
     cfg.pin_pclk      = PCLK_GPIO_NUM;
     cfg.pin_vsync     = VSYNC_GPIO_NUM;
     cfg.pin_href      = HREF_GPIO_NUM;
-    cfg.pin_sccb_sda  = SCCB_OWN_BUS ? -1 : SIOD_GPIO_NUM;   // -1: barramento próprio
-    cfg.pin_sccb_scl  = SCCB_OWN_BUS ? -1 : SIOC_GPIO_NUM;
-    cfg.sccb_i2c_port = I2C_NUM_0;
+    cfg.pin_sccb_sda  = SIOD_GPIO_NUM;
+    cfg.pin_sccb_scl  = SIOC_GPIO_NUM;
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
