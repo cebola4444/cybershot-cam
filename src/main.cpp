@@ -370,9 +370,10 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
-    // 10 MHz nos dois modos: na foto (UXGA) o aec 1200 vale ~1/8 s — o dobro de luz do que
-    // a 20 MHz, menos ganho/ruído no escuro. O driver faz soft-reset a cada init.
-    cfg.xclk_freq_hz = 10000000;
+    // VF em 10 MHz (calibração de exposição do VF); foto em 20 MHz — o único caminho de
+    // reinit que entregou frames de forma consistente (a 10 MHz o 1º frame JPEG após a
+    // troca de modo demorou/não veio). O driver faz soft-reset a cada init.
+    cfg.xclk_freq_hz = (fmt == PIXFORMAT_JPEG) ? 20000000 : 10000000;
 
     cfg.pixel_format = fmt;
     // JPEG: o driver dimensiona o frame buffer por w*h/5 do frame_size do init. XGA daria
@@ -418,7 +419,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_whitebal(s, 1);    // AWB ligado — corrige dominância de cor
             s->set_awb_gain(s, 1);
             s->set_wb_mode(s, 0);
-            s->set_aec_value(s, vfAecValue);   // mesmo XCLK do VF; o laço de medição refina
+            s->set_aec_value(s, min(1200, vfAecValue * 2));   // XCLK 2× → aec 2×; a medição refina
             s->set_agc_gain(s, vfAgcGain);
         }
     }
@@ -1217,10 +1218,11 @@ static bool initJpegForCapture(uint8_t fbCount) {
     for (int t = 1; t <= 2; t++) {
         if (t > 1) delay(300);
         if (!initCamera(PIXFORMAT_JPEG, CAP_SIZE, 12, fbCount)) continue;
-        if (!camVsyncAlive(400)) { dlog("[CAP] t%d sem VSYNC", t); continue; }
+        bool vs = camVsyncAlive(1000);   // só informativo: o teste real é o frame chegar
         unsigned long tw = millis();
         camera_fb_t* w = esp_camera_fb_get();
-        dlog("[CAP] t%d w0 %s %uB %lums", t, w ? "ok" : "NULL", w ? (unsigned)w->len : 0, millis() - tw);
+        dlog("[CAP] t%d vsync %d w0 %s %uB %lums", t, vs, w ? "ok" : "NULL",
+             w ? (unsigned)w->len : 0, millis() - tw);
         if (w) { esp_camera_fb_return(w); return true; }
     }
     return false;
@@ -1232,7 +1234,7 @@ static bool initJpegForCapture(uint8_t fbCount) {
 static camera_fb_t* grabCaptureFrame(const char* label, int pct) {
     drawCaptureStatus(label, pct);
     if (!initJpegForCapture(1)) return nullptr;
-    int aec = vfAecValue, gain = vfAgcGain;
+    int aec = min(1200, vfAecValue * 2), gain = vfAgcGain;
     int target = aeTarget();
     for (int it = 0; it < 3; it++) {
         camDropFrames(1);   // latência do sensor ao aplicar aec/gain
