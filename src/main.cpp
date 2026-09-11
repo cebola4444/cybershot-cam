@@ -1513,6 +1513,7 @@ void recordVideo() {
 
     dlog("[VID] rec %s", name + 1);
     tft.fillScreen(ST77XX_BLACK);
+    digitalWrite(LED_FLASH, HIGH);   // luz ligada durante toda a gravação
 
     while (millis() - t0 < totalMs && frames < (uint32_t)VIDEO_MAX_FRAMES) {
         camera_fb_t* fb = esp_camera_fb_get();
@@ -1553,6 +1554,7 @@ void recordVideo() {
 
         if (millis() - t0 > 1000 && digitalRead(BTN_PIN) == LOW) { stopped = true; break; }
     }
+    digitalWrite(LED_FLASH, LOW);
 
     unsigned long elapsed = (frames > 1) ? (lastMs - firstMs) : 0;
     uint32_t usPerFrame = (frames > 1) ? (uint32_t)(elapsed * 1000UL / (frames - 1)) : 125000;
