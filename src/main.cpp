@@ -278,12 +278,14 @@ static const framesize_t CAP_SIZE = FRAMESIZE_XGA;     // 1024×768
 
 // true se o pino VSYNC mudou de nível dentro de `ms` (sensor está gerando frames).
 // No S3 o driver lê VSYNC pelo periférico LCD_CAM, não por interrupção de GPIO — ler o
-// pino diretamente não interfere.
+// pino diretamente não interfere. gpio_get_level (IDF), não digitalRead: o Arduino 3.x
+// devolve 0 para pinos que não passaram por pinMode(), e este foi configurado pelo driver.
 static bool camVsyncAlive(int ms) {
-    int last = digitalRead(VSYNC_GPIO_NUM);
+    const gpio_num_t pin = (gpio_num_t)VSYNC_GPIO_NUM;
+    int last = gpio_get_level(pin);
     unsigned long t0 = millis();
     while (millis() - t0 < (unsigned long)ms) {
-        if (digitalRead(VSYNC_GPIO_NUM) != last) return true;
+        if (gpio_get_level(pin) != last) return true;
         delayMicroseconds(200);
     }
     return false;
@@ -2446,6 +2448,7 @@ void setup() {
     tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
     tft.setTextColor(ST77XX_GREEN);
     tft.setCursor(8, 38); tft.print("CAM  OK");
+    dlog("[CAM] vsync alive=%d", camVsyncAlive(400));   // auto-verificação da checagem (deve ser 1)
     delay(300);
 
     tft.fillScreen(ST77XX_BLACK);
