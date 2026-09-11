@@ -141,13 +141,17 @@ int measureLuma(const uint8_t* buf, int w, int h) {
     return count ? (int)(sum / count) : 0;
 }
 
+// Alvo de luma com a compensação EV aplicada (usado pelo VF e pela medição da foto).
+static int aeTarget() {
+    if (evComp > 0) return min(13000, LUMA_TARGET << evComp);
+    if (evComp < 0) return max(200,   LUMA_TARGET >> (-evComp));
+    return LUMA_TARGET;
+}
+
 // Ajusta vfAecValue/vfAgcGain para atingir LUMA_TARGET e aplica imediatamente ao sensor.
 // Estratégia em dois estágios: primeiro esgota aec_value, depois toca gain (e vice-versa).
 void autoExposure(int avgLuma) {
-    int target = LUMA_TARGET;
-    if      (evComp > 0) target = min(13000, LUMA_TARGET << evComp);
-    else if (evComp < 0) target = max(200,   LUMA_TARGET >> (-evComp));
-
+    int target = aeTarget();
     int diff = avgLuma - target;
     if (abs(diff) < LUMA_HYST) return;
 
@@ -227,8 +231,10 @@ static void logPush(const char* s) {
 
 static void dlog(const char* fmt, ...) {
     char buf[LOG_W + 32];
+    unsigned long ms = millis();
+    int n = snprintf(buf, sizeof(buf), "%lu.%lu ", ms / 1000, (ms / 100) % 10);   // segundos desde o boot
     va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
     va_end(ap);
     logPush(buf);
     Serial.println(buf);
@@ -254,14 +260,16 @@ static bool logGet(int i, char* out) {
 
 // ─── Câmera ───────────────────────────────────────────────────────────────────
 
-// A câmera é inicializada UMA vez, em JPEG XGA, e fica nesse modo o tempo todo:
-// viewfinder e foto usam o MESMO frame (o VF decodifica a 1/8 = 128×96). Nada de
-// deinit/init nem set_framesize em operação: nesta placa (sem RESET/PWDN, driver S3)
-// tanto o reinit quanto a troca de resolução em streaming travam o OV2640 às vezes
-// (logs 2026-09-10/11: init "ok" sem frames; depois "Detected camera not supported").
-static const framesize_t CAP_SIZE = FRAMESIZE_XGA;   // 1024×768
+// A câmera é inicializada UMA vez (JPEG, buffer dimensionado para UXGA) e nunca mais
+// passa por deinit/init em operação — nesta placa (sem RESET/PWDN, driver S3) o reinit
+// é uma roleta (init "ok" sem frames). O viewfinder roda em QQVGA (modo CIF do sensor:
+// baixo consumo/calor, como no firmware antigo, que só ia para UXGA ~1 s por foto) e a
+// foto troca para XGA com set_framesize. Depois de cada troca de resolução esperamos
+// frames antes de escrever qualquer outro registrador — o DSP do OV2640 precisa assentar.
+static const framesize_t VF_SIZE  = FRAMESIZE_QQVGA;   // 160×120
+static const framesize_t CAP_SIZE = FRAMESIZE_XGA;     // 1024×768
 
-// Descarta n frames (antigos na fila / em andamento).
+// Descarta n frames (antigos na fila / em andamento). Para no 1º NULL.
 static void camDropFrames(int n) {
     for (int i = 0; i < n; i++) {
         camera_fb_t* fb = esp_camera_fb_get();
@@ -270,7 +278,7 @@ static void camDropFrames(int n) {
     }
 }
 
-// Exposição manual do VF — a foto usa os mesmos valores (mesmo modo do sensor).
+// Exposição manual do VF (também desliga o AE automático deixado pela long exposure).
 static void camApplyVfExposure() {
     sensor_t* s = esp_camera_sensor_get();
     if (!s) return;
@@ -278,6 +286,28 @@ static void camApplyVfExposure() {
     s->set_gain_ctrl(s, 0);
     s->set_aec_value(s, vfAecValue);
     s->set_agc_gain(s, vfAgcGain);
+}
+
+// Modo viewfinder: QQVGA → assenta → exposição manual do VF.
+static void camSetVf() {
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return;
+    s->set_framesize(s, VF_SIZE);
+    camDropFrames(3);
+    camApplyVfExposure();
+    camDropFrames(1);
+}
+
+// Modo foto: XGA → assenta → chute inicial de exposição (o laço de medição corrige).
+static void camSetCapture(int& aec, int& gain) {
+    aec  = constrain(vfAecValue / 2, 4, 1200);
+    gain = vfAgcGain;
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return;
+    s->set_framesize(s, CAP_SIZE);
+    camDropFrames(2);
+    s->set_aec_value(s, aec);
+    s->set_agc_gain(s, gain);
 }
 
 bool initCamera() {
@@ -347,10 +377,9 @@ bool initCamera() {
     }
     delay(200);
 
+    camDropFrames(2);   // deixa o sensor assentar após o init antes de escrever
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
-        s->set_framesize(s, CAP_SIZE);   // única troca de resolução: aqui, logo após o soft-reset
-        delay(100);
         s->set_hmirror(s, 1);
         s->set_brightness(s, 1);
         s->set_gainceiling(s, GAINCEILING_128X);
@@ -358,8 +387,7 @@ bool initCamera() {
         s->set_awb_gain(s, 1);
         s->set_wb_mode(s, 0);
     }
-    camApplyVfExposure();
-    camDropFrames(3);
+    camSetVf();
     dlog("[CAM] init ok %lums", millis() - t0);
     return true;
 }
@@ -1041,27 +1069,10 @@ static void showDiagScreen(const char* title) {
     }
 }
 
-// Volta ao viewfinder após foto/erro. Só escreve no sensor se a long exposure deixou o AE
-// automático ligado — fora isso, zero tráfego SCCB depois da foto (fase de pico de corrente).
-static bool camAeAuto = false;
+// Volta ao viewfinder após foto/erro (QQVGA + exposição manual do VF).
 static void restoreViewfinder() {
-    if (camAeAuto) { camApplyVfExposure(); camAeAuto = false; }
+    camSetVf();
     vfNeedsClear = true;
-}
-
-// Próximo frame XGA completo com o flash já ligado: descarta 2 (fila GRAB_LATEST de 2 +
-// frame em andamento podem ser de antes do flash). Frames < 20 KB são parciais. NULL = nada.
-static camera_fb_t* grabCaptureFrame(const char* label, int pct) {
-    drawCaptureStatus(label, pct);
-    for (int i = 0; i < 6; i++) {
-        unsigned long tw = millis();
-        camera_fb_t* fb = esp_camera_fb_get();
-        dlog("[CAP] f%d %s %uB %lums", i, fb ? "ok" : "NULL", fb ? (unsigned)fb->len : 0, millis() - tw);
-        if (!fb) return nullptr;
-        if (i >= 2 && fb->len >= 20000) return fb;
-        esp_camera_fb_return(fb);
-    }
-    return nullptr;
 }
 
 // ─── Preview JPEG no TFT ─────────────────────────────────────────────────────
@@ -1109,9 +1120,9 @@ void showPreview(uint8_t* buf, size_t len, const char* filename) {
 }
 
 // ─── Viewfinder JPEG → RGB565 ────────────────────────────────────────────────
-// O VF decodifica o frame XGA a 1/8 (128×96, só coeficientes DC — rápido) para decBuf,
-// no mesmo layout big-endian que o sensor entregava em RGB565 (measureLuma/toGreenTones
-// iguais), e amplia 4:5 para vfBuf 160×120 para o TFT.
+// O VF decodifica o frame QQVGA (JPEG) com JPEGDEC para vfBuf no mesmo layout big-endian
+// que o sensor entregava em RGB565 (measureLuma/toGreenTones/writePixels iguais).
+// decBuf recebe frames XGA decodificados a 1/8 (128×96) — medição de luma da foto.
 
 static const int DEC_W = 128, DEC_H = 96;     // 1024/8 × 768/8
 static const int VF_W  = 160, VF_H  = 120;
@@ -1119,6 +1130,40 @@ static uint8_t*  decBuf = nullptr;
 static uint8_t*  vfBuf  = nullptr;
 static int       vfFailCount = 0;
 static int       vfLastLuma  = 0;
+
+static int vfCb(JPEGDRAW* d) {
+    for (int r = 0; r < d->iHeight; r++) {
+        int y = d->y + r;
+        if (y >= VF_H) break;
+        int w = min(d->iWidth, VF_W - d->x);
+        if (w <= 0) continue;
+        memcpy(vfBuf + ((long)y * VF_W + d->x) * 2,
+               (uint8_t*)d->pPixels + (long)r * d->iWidth * 2, w * 2);
+    }
+    return 1;
+}
+
+// Decodifica o frame QQVGA do VF em vfBuf. Loga (poucas vezes) o motivo de falha.
+static bool decodeVf(camera_fb_t* fb) {
+    static int nlog = 0;
+    if (!vfBuf || fb->len < 100) return false;
+    if (!_jpeg.openRAM(fb->buf, (int)fb->len, vfCb)) {
+        if (nlog++ < 3) dlog("[VF] open fail len %u %02X%02X%02X%02X", (unsigned)fb->len,
+                             fb->buf[0], fb->buf[1], fb->buf[2], fb->buf[3]);
+        return false;
+    }
+    int w = _jpeg.getWidth(), h = _jpeg.getHeight();
+    bool ok = false;
+    if (w >= 128 && w <= 176 && h >= 96 && h <= 144) {   // cabeçalho pode vir arredondado
+        _jpeg.setPixelType(RGB565_BIG_ENDIAN);
+        ok = _jpeg.decode(0, 0, 0) != 0;
+        if (!ok && nlog++ < 3) dlog("[VF] decode fail %dx%d err %d", w, h, _jpeg.getLastError());
+    } else if (nlog++ < 3) {
+        dlog("[VF] jpeg %dx%d inesperado", w, h);
+    }
+    _jpeg.close();
+    return ok;
+}
 
 static int decCb(JPEGDRAW* d) {
     for (int r = 0; r < d->iHeight; r++) {
@@ -1149,19 +1194,49 @@ static bool decodeEighth(uint8_t* jpg, size_t len) {
     return ok;
 }
 
-// 128×96 → 160×120, vizinho mais próximo (4:5). Copia em uint16 — mantém os bytes big-endian.
-static void upscaleToVf() {
-    const uint16_t* src = (const uint16_t*)decBuf;
-    uint16_t*       dst = (uint16_t*)vfBuf;
-    for (int y = 0; y < VF_H; y++) {
-        const uint16_t* srow = src + (y * DEC_H / VF_H) * DEC_W;
-        uint16_t*       drow = dst + y * VF_W;
-        for (int x = 0; x < VF_W; x++) drow[x] = srow[x * DEC_W / VF_W];
-    }
-}
-
 static int photoLuma(uint8_t* jpg, size_t len) {
     return decodeEighth(jpg, len) ? measureLuma(decBuf, DEC_W, DEC_H) : -1;
+}
+
+// Próximo frame XGA completo (≥ 20 KB; frames QQVGA antigos na fila são menores). NULL = nada.
+static camera_fb_t* camNextXgaFrame() {
+    for (int i = 0; i < 6; i++) {
+        unsigned long tw = millis();
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) { dlog("[CAP] frame NULL %lums", millis() - tw); return nullptr; }
+        if (fb->len >= 20000) return fb;
+        esp_camera_fb_return(fb);
+    }
+    return nullptr;
+}
+
+// Foto: muda para XGA e MEDE a luma do frame (decode a 1/8) para corrigir aec/ganho antes
+// de capturar — VF (CIF) e foto (UXGA) têm tempos de linha diferentes, e medir é mais
+// confiável que qualquer fator fixo. Até 3 iterações; devolve o frame da última medição.
+static camera_fb_t* grabCaptureFrame(const char* label, int pct) {
+    drawCaptureStatus(label, pct);
+    int aec, gain;
+    camSetCapture(aec, gain);
+    int target = aeTarget();
+    for (int it = 0; it < 3; it++) {
+        camDropFrames(2);   // latência do sensor ao aplicar aec/gain (1–2 frames)
+        camera_fb_t* fb = camNextXgaFrame();
+        if (!fb) return nullptr;
+        int luma = decodeEighth(fb->buf, fb->len) ? measureLuma(decBuf, DEC_W, DEC_H) : -1;
+        dlog("[CAP] it%d aec %d g %d luma %d alvo %d %uB", it, aec, gain, luma, target, (unsigned)fb->len);
+        if (luma < 0 || it == 2 || abs(luma - target) <= target * 3 / 10) return fb;
+        esp_camera_fb_return(fb);
+
+        // razão até o alvo → exposição primeiro (até 1200 linhas), resto em ganho (5 un. ≈ 1 stop)
+        float ratio = constrain((float)target / (float)max(luma, 50), 0.125f, 8.0f);
+        float aecF  = aec * ratio;
+        int newAec  = (int)constrain(aecF, 4.0f, 1200.0f);
+        int newGain = constrain(gain + (int)lroundf(5.0f * log2f(aecF / newAec)), 0, 30);
+        aec = newAec; gain = newGain;
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) { s->set_aec_value(s, aec); s->set_agc_gain(s, gain); }
+    }
+    return nullptr;
 }
 
 // ─── Long exposure: stacking de frames ──────────────────────────────────────
@@ -1195,7 +1270,8 @@ void takeLongExposureStacked() {
     tft.fillScreen(gbPalette[0]);
     drawCaptureStatus("SETTLING...", 3);
 
-    // sensor já está em XGA; acumuladores uint16_t = 4.5MB (cabe nos 8MB PSRAM)
+    // XGA com assentamento; acumuladores uint16_t = 4.5MB (cabe nos 8MB PSRAM)
+    { int a, g; camSetCapture(a, g); }
 
     // Começa com exposição máxima, habilita AE auto — converge de cima pra baixo (rápido)
     {
@@ -1205,7 +1281,6 @@ void takeLongExposureStacked() {
             s->set_agc_gain(s, 30);
             s->set_exposure_ctrl(s, 1);
             s->set_gain_ctrl(s, 1);
-            camAeAuto = true;   // restoreViewfinder volta para manual
         }
     }
 
@@ -2992,18 +3067,16 @@ void loop() {
         return;
     }
 
-    bool decoded = decodeEighth(fb->buf, fb->len);
+    bool decoded = decodeVf(fb);
     esp_camera_fb_return(fb);   // devolve o buffer antes de qualquer chamada SCCB
-    if (!decoded) { delay(1); return; }   // frame parcial/corrompido
+    if (!decoded) { delay(1); return; }   // frame XGA antigo na fila / parcial
     vfFailCount = 0;
 
-    // ~8 fps em XGA → AE a cada 5 frames ≈ 1,6×/s (sensor aplica aec/gain em 1–2 frames)
-    bool doAE = (++vfFrameCnt % 5 == 0);
-    int  aeLuma = doAE ? measureLuma(decBuf, DEC_W, DEC_H) : 0;
+    bool doAE = (++vfFrameCnt % 10 == 0);
+    int  aeLuma = doAE ? measureLuma(vfBuf, VF_W, VF_H) : 0;
     if (doAE) vfLastLuma = aeLuma;
 
-    toGreenTones(decBuf, DEC_W, DEC_H);
-    upscaleToVf();
+    toGreenTones(vfBuf, VF_W, VF_H);
 
     tft.startWrite();
     tft.setAddrWindow(0, (128 - VF_H) / 2, VF_W, VF_H);
