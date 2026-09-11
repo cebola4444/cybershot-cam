@@ -1730,6 +1730,9 @@ void handleEditor() {
         "#bSave{border-color:#ff0;color:#ff0;flex:2}"
         "#bSave.on{background:#ff0;color:#000}"
         ".divider{height:1px;background:#161616;margin:8px 0}"
+        ".vid button{color:#f80;border-color:#f80}"
+        ".vid button.on{background:#f80;color:#000}"
+        "[hidden]{display:none!important}"
         "</style></head><body>"
     );
 
@@ -1755,6 +1758,18 @@ void handleEditor() {
         "<div id='status'>loading...</div>"
         "</div>"
         "<div class='ctrl-panel'>"
+
+        "<div id='vidSec' hidden>"
+        "<div class='sec'>video</div>"
+        "<div class='row'><label>frame</label><input type='range' id='sFrm' min='0' max='0' value='0'><span class='val' id='vFrm'>0</span></div>"
+        "<div class='btns vid'><button id='bPlay'>&#9654; play</button></div>"
+        "<div class='sec'>export</div>"
+        "<div class='btns vid'><button id='bSc1'>1/1</button><button id='bSc2' class='on'>1/2</button><button id='bSc4'>1/4</button></div>"
+        "<div class='btns vid'><button id='bFpsAll' class='on'>all frames</button><button id='bFpsHalf'>half fps</button></div>"
+        "<div class='btns vid'><button id='bPalC' class='on'>256 colors</button><button id='bPalG'>green 4</button><button id='bDith' class='on'>dither</button></div>"
+        "<div class='btns vid'><button id='bToDl' class='on'>&#8595; download</button><button id='bToSd'>&#8594; SD card</button></div>"
+        "<div class='btns vid'><button id='bGif'>export GIF</button><button id='bVid'>export video</button></div>"
+        "</div>"
 
         "<div class='sec'>adjust</div>"
         "<div class='row'><label>brightness</label><input type='range' id='sBri' min='-100' max='100' value='0'><span class='val' id='vBri'>0</span></div>"
@@ -1850,7 +1865,7 @@ void handleEditor() {
     {static const char _s[] =
         "<script>"
         "const c=document.getElementById('c'),ctx=c.getContext('2d');"
-        "let orig=null,origW=0,origH=0,rot=0,flipH=false,filt=null,eightOn=false,cropRatio=null,asciiOn=false,asciiCs=0,asciiCol='mono';"
+        "let orig=null,origW=0,origH=0,rot=0,flipH=false,filt=null,eightOn=false,cropRatio=null,asciiOn=false,asciiCs=0,asciiCol='mono',vidCrop=null,isVideo=false;"
         "const img=new Image();"
         "img.crossOrigin='anonymous';"
         "img.onload=()=>{"
@@ -1863,10 +1878,10 @@ void handleEditor() {
           "render();"
         "};"
         "img.onerror=()=>document.getElementById('status').textContent='erro ao carregar';"
-        "img.src='";
+        "const SRC='";
     server.sendContent(_s, sizeof(_s)-1);}
     server.sendContent(src);
-    server.sendContent("';", 2);
+    server.sendContent("';if(/\\.avi$/i.test(SRC)){isVideo=true;}else{img.src=SRC;}");
 
     // JS: render()
     server.sendContent(
@@ -2031,6 +2046,12 @@ void handleEditor() {
               "ctx.beginPath();ctx.moveTo(cx+cw*ti/3,cy);ctx.lineTo(cx+cw*ti/3,cy+ch);ctx.stroke();"
               "ctx.beginPath();ctx.moveTo(cx,cy+ch*ti/3);ctx.lineTo(cx+cw,cy+ch*ti/3);ctx.stroke();}"
           "}"
+          // crop de vídeo: mesmo retângulo aplicado a todos os frames, no fim do pipeline
+          "if(vidCrop){"
+            "const vx=Math.min(vidCrop.x,c.width-1),vy=Math.min(vidCrop.y,c.height-1);"
+            "const vw=Math.max(1,Math.min(vidCrop.w,c.width-vx)),vh=Math.max(1,Math.min(vidCrop.h,c.height-vy));"
+            "const vd=ctx.getImageData(vx,vy,vw,vh);c.width=vw;c.height=vh;ctx.putImageData(vd,0,0);"
+          "}"
         "}"
     );
 
@@ -2139,6 +2160,8 @@ void handleEditor() {
           "const px2=+document.getElementById('sCrX').value/100;"
           "const py2=+document.getElementById('sCrY').value/100;"
           "const cx=Math.round(px2*(CW-cw)),cy=Math.round(py2*(CH-ch));"
+          "if(isVideo){vidCrop={x:cx,y:cy,w:cw,h:ch};setRatio('bCrOrig',null);"
+            "document.getElementById('status').textContent=cw+'x'+ch+' — crop (video)';return;}"
           "cropRatio=null;render();"
           "const cd=ctx.getImageData(cx,cy,Math.max(1,cw),Math.max(1,ch));"
           "c.width=cw;c.height=ch;ctx.putImageData(cd,0,0);"
@@ -2157,7 +2180,7 @@ void handleEditor() {
           "['vBri','vCon','vSat','vSha','vHil','vTemp','vFade','vVig','vCA'].forEach(v=>document.getElementById(v).textContent=0);"
           "['sPsMin','sPsMax'].forEach(s=>document.getElementById(s).value=s==='sPsMin'?20:80);"
           "document.getElementById('vPsMin').textContent=20;document.getElementById('vPsMax').textContent=80;"
-          "filt=null;rot=0;flipH=false;psOn=false;psDir='h';psKey='luma';eightOn=false;cropRatio=null;asciiOn=false;asciiCs=0;asciiCol='mono';"
+          "filt=null;rot=0;flipH=false;psOn=false;psDir='h';psKey='luma';eightOn=false;cropRatio=null;vidCrop=null;asciiOn=false;asciiCs=0;asciiCol='mono';"
           "document.getElementById('bFlip').classList.remove('on');"
           "['bGray','bSepia','bInvert','bNoir'].forEach(id=>document.getElementById(id).classList.remove('on'));"
           "setRatio('bCrOrig',null);"
@@ -2180,6 +2203,96 @@ void handleEditor() {
           "['bPsHue','bPsSat'].forEach(id=>document.getElementById(id).classList.remove('on'));"
           "render();};"
     );
+
+    // JS: vídeo (.avi MJPEG) — parse no navegador, player, export GIF (LZW próprio) e vídeo (MediaRecorder)
+    {static const char _v[] = R"JS(
+let vidFrames=[],vidBuf=null,vidFps=8,vidIdx=0,playing=false,expScale=.5,expStep=1,expPal='c',expDither=true,saveTo='dl';
+const $=id=>document.getElementById(id);
+function st(t){$('status').textContent=t;}
+function tick(){return new Promise(r=>setTimeout(r,0));}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+function tag4(u,p){return String.fromCharCode(u[p],u[p+1],u[p+2],u[p+3]);}
+function parseAvi(buf){const u=new Uint8Array(buf),dv=new DataView(buf),fr=[];let p=12,mv=-1,me=0;
+ while(p+8<=u.length){const t=tag4(u,p),sz=dv.getUint32(p+4,true);if(t==='LIST'&&tag4(u,p+8)==='movi'){mv=p+12;me=p+8+sz;break;}p+=8+sz+(sz&1);}
+ if(mv<0)return fr;p=mv;
+ while(p+8<=Math.min(me,u.length)){const t=tag4(u,p),sz=dv.getUint32(p+4,true);if(t==='00dc'||t==='00db'||t==='00dB')fr.push([p+8,sz]);p+=8+sz+(sz&1);}
+ if(u.length>136&&tag4(u,100)==='strh'){const sc=dv.getUint32(128,true),ra=dv.getUint32(132,true);if(sc>0&&ra>0)vidFps=Math.max(1,Math.min(60,ra/sc));}
+ return fr;}
+async function decodeFrame(i){const [o,l]=vidFrames[i];const blob=new Blob([new Uint8Array(vidBuf,o,l)],{type:'image/jpeg'});
+ if(window.createImageBitmap){try{return await createImageBitmap(blob);}catch(e){}}
+ return new Promise((res,rej)=>{const im=new Image();const u=URL.createObjectURL(blob);im.onload=()=>{URL.revokeObjectURL(u);res(im);};im.onerror=()=>{URL.revokeObjectURL(u);rej();};im.src=u;});}
+async function loadFrame(i){const bm=await decodeFrame(i);const w=bm.width,h=bm.height;const t=document.createElement('canvas');t.width=w;t.height=h;
+ const tc=t.getContext('2d',{willReadFrequently:true});tc.drawImage(bm,0,0);orig=tc.getImageData(0,0,w,h);origW=w;origH=h;if(bm.close)bm.close();
+ vidIdx=i;$('sFrm').value=i;$('vFrm').textContent=i;}
+async function showFrame(i){await loadFrame(i);render();}
+async function loadAvi(){try{st('baixando video...');const r=await fetch(SRC);vidBuf=await r.arrayBuffer();vidFrames=parseAvi(vidBuf);
+ if(!vidFrames.length){st('avi sem frames');return;}
+ $('vidSec').hidden=false;$('sFrm').max=vidFrames.length-1;await showFrame(0);
+ st(origW+'x'+origH+' - '+vidFrames.length+' frames @ '+vidFps.toFixed(1)+' fps');}catch(e){st('erro ao carregar video');}}
+$('sFrm').addEventListener('input',()=>{if(!playing)showFrame(+$('sFrm').value);});
+async function playLoop(){while(playing){const t0=performance.now();await showFrame((vidIdx+1)%vidFrames.length);await sleep(Math.max(0,1000/vidFps-(performance.now()-t0)));}}
+$('bPlay').onclick=()=>{playing=!playing;$('bPlay').innerHTML=playing?'&#10074;&#10074; pause':'&#9654; play';$('bPlay').classList.toggle('on',playing);if(playing)playLoop();};
+function setOn(ids,on){ids.forEach(id=>$(id).classList.toggle('on',id===on));}
+$('bSc1').onclick=()=>{expScale=1;setOn(['bSc1','bSc2','bSc4'],'bSc1');};
+$('bSc2').onclick=()=>{expScale=.5;setOn(['bSc1','bSc2','bSc4'],'bSc2');};
+$('bSc4').onclick=()=>{expScale=.25;setOn(['bSc1','bSc2','bSc4'],'bSc4');};
+$('bFpsAll').onclick=()=>{expStep=1;setOn(['bFpsAll','bFpsHalf'],'bFpsAll');};
+$('bFpsHalf').onclick=()=>{expStep=2;setOn(['bFpsAll','bFpsHalf'],'bFpsHalf');};
+$('bPalC').onclick=()=>{expPal='c';setOn(['bPalC','bPalG'],'bPalC');};
+$('bPalG').onclick=()=>{expPal='g';setOn(['bPalC','bPalG'],'bPalG');};
+$('bDith').onclick=()=>{expDither=!expDither;$('bDith').classList.toggle('on',expDither);};
+$('bToDl').onclick=()=>{saveTo='dl';setOn(['bToDl','bToSd'],'bToDl');};
+$('bToSd').onclick=()=>{saveTo='sd';setOn(['bToDl','bToSd'],'bToSd');};
+function BW(){this.b=new Uint8Array(1<<20);this.n=0;}
+BW.prototype.byte=function(v){if(this.n>=this.b.length){const nb=new Uint8Array(this.b.length*2);nb.set(this.b);this.b=nb;}this.b[this.n++]=v&255;};
+BW.prototype.u16=function(v){this.byte(v);this.byte(v>>8);};
+BW.prototype.str=function(s){for(let i=0;i<s.length;i++)this.byte(s.charCodeAt(i));};
+BW.prototype.arr=function(a,n){for(let i=0;i<n;i++)this.byte(a[i]);};
+function lzw(idx,mcs,wr){const clr=1<<mcs,eoi=clr+1;let next=eoi+1,cs=mcs+1,tbl=new Map(),acc=0,nb=0,bl=0;const blk=new Uint8Array(255);
+ const put=v=>{acc|=v<<nb;nb+=cs;while(nb>=8){blk[bl++]=acc&255;acc>>>=8;nb-=8;if(bl===255){wr.byte(255);wr.arr(blk,255);bl=0;}}};
+ put(clr);let pre=idx[0];
+ for(let i=1;i<idx.length;i++){const k=idx[i],key=(pre<<8)|k,e=tbl.get(key);if(e!==undefined){pre=e;continue;}put(pre);
+  if(next===4096){put(clr);next=eoi+1;cs=mcs+1;tbl=new Map();}else{if(next>=(1<<cs))cs++;tbl.set(key,next++);}pre=k;}
+ put(pre);put(eoi);if(nb>0){blk[bl++]=acc&255;if(bl===255){wr.byte(255);wr.arr(blk,255);bl=0;}}if(bl>0){wr.byte(bl);wr.arr(blk,bl);}wr.byte(0);}
+const BAYER=[[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+function makePalette(pal){if(pal==='g')return{tab:new Uint8Array([0,24,0,0,77,0,0,146,0,0,251,0]),bits:1,mcs:2};
+ const t=new Uint8Array(768);let k=0;for(let r=0;r<6;r++)for(let g=0;g<7;g++)for(let b=0;b<6;b++){t[k++]=r*51;t[k++]=Math.round(g*42.5);t[k++]=b*51;}return{tab:t,bits:7,mcs:8};}
+function quantize(d,W,H,pal,dith){const out=new Uint8Array(W*H);
+ if(pal==='g'){for(let y=0,i=0;y<H;y++)for(let x=0;x<W;x++,i++){const p=i*4;let l=.299*d[p]+.587*d[p+1]+.114*d[p+2];if(dith)l+=(BAYER[y&3][x&3]/16-.5)*40;out[i]=l<77?0:l<153?1:l<230?2:3;}return out;}
+ for(let y=0,i=0;y<H;y++)for(let x=0;x<W;x++,i++){const p=i*4,dz=dith?(BAYER[y&3][x&3]/16-.5):0;
+  const r=Math.max(0,Math.min(5,Math.round(d[p]/51+dz))),g=Math.max(0,Math.min(6,Math.round(d[p+1]/42.5+dz))),b=Math.max(0,Math.min(5,Math.round(d[p+2]/51+dz)));out[i]=r*42+g*6+b;}
+ return out;}
+function gifHeader(wr,W,H,pal){const p=makePalette(pal);wr.str('GIF89a');wr.u16(W);wr.u16(H);wr.byte(0x80|0x70|p.bits);wr.byte(0);wr.byte(0);wr.arr(p.tab,p.tab.length);
+ wr.byte(0x21);wr.byte(0xFF);wr.byte(11);wr.str('NETSCAPE2.0');wr.byte(3);wr.byte(1);wr.u16(0);wr.byte(0);return p;}
+function gifFrame(wr,W,H,idx,mcs,delay){wr.byte(0x21);wr.byte(0xF9);wr.byte(4);wr.byte(0);wr.u16(delay);wr.byte(0);wr.byte(0);
+ wr.byte(0x2C);wr.u16(0);wr.u16(0);wr.u16(W);wr.u16(H);wr.byte(0);wr.byte(mcs);lzw(idx,mcs,wr);}
+async function deliver(blob,name){if(saveTo==='sd'){st('enviando para o SD...');const fd=new FormData();fd.append('f',blob,name);
+  try{const r=await fetch('/save-edit',{method:'POST',body:fd});if(!r.ok)throw 0;st('salvo no SD: '+await r.text());}catch(e){st('erro ao salvar no SD');}return;}
+ const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),30000);}
+async function exportGif(){if(playing)$('bPlay').click();const N=vidFrames.length;await showFrame(0);
+ const W=Math.max(1,Math.round(c.width*expScale)),H=Math.max(1,Math.round(c.height*expScale));
+ const oc=document.createElement('canvas');oc.width=W;oc.height=H;const octx=oc.getContext('2d',{willReadFrequently:true});
+ const wr=new BW();const p=gifHeader(wr,W,H,expPal);const delay=Math.max(2,Math.round(100*expStep/vidFps));
+ for(let i=0;i<N;i+=expStep){await showFrame(i);octx.drawImage(c,0,0,W,H);const id=octx.getImageData(0,0,W,H);
+  gifFrame(wr,W,H,quantize(id.data,W,H,expPal,expDither),p.mcs,delay);st('gif '+(i+1)+'/'+N);await tick();}
+ wr.byte(0x3B);const blob=new Blob([wr.b.subarray(0,wr.n)],{type:'image/gif'});st('gif '+Math.round(blob.size/1024)+' KB');await deliver(blob,'cybershot.gif');}
+async function exportVideo(){const mime=['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m));
+ if(!mime||!window.createImageBitmap){st('navegador sem gravacao de video');return;}
+ if(playing)$('bPlay').click();const N=vidFrames.length;await showFrame(0);
+ const W=Math.max(2,Math.round(c.width*expScale/2)*2),H=Math.max(2,Math.round(c.height*expScale/2)*2);
+ const oc=document.createElement('canvas');oc.width=W;oc.height=H;const octx=oc.getContext('2d');const bms=[];
+ for(let i=0;i<N;i+=expStep){await showFrame(i);octx.drawImage(c,0,0,W,H);bms.push(await createImageBitmap(oc));st('render '+(i+1)+'/'+N);await tick();}
+ c.width=W;c.height=H;const fps=vidFps/expStep;const stream=c.captureStream(fps);
+ const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:6000000});const chunks=[];rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
+ const done=new Promise(r=>rec.onstop=r);rec.start(200);st('gravando...');const per=1000/fps;let t=performance.now();
+ for(const b of bms){ctx.drawImage(b,0,0);t+=per;await sleep(Math.max(0,t-performance.now()));}
+ await sleep(per+200);rec.stop();await done;bms.forEach(b=>{if(b.close)b.close();});
+ const blob=new Blob(chunks,{type:mime});const ext=mime.indexOf('mp4')>=0?'mp4':'webm';st('video '+Math.round(blob.size/1024)+' KB');
+ await deliver(blob,'cybershot.'+ext);await showFrame(vidIdx);}
+$('bGif').onclick=()=>{exportGif();};$('bVid').onclick=()=>{exportVideo();};
+if(isVideo)loadAvi();
+)JS";
+    server.sendContent(_v, sizeof(_v)-1);}
 
     {static const char _s[] =
         "document.getElementById('bSave').onclick=()=>{"
@@ -2212,7 +2325,9 @@ void handleSaveEditUpload() {
     HTTPUpload& up = server.upload();
     if (up.status == UPLOAD_FILE_START) {
         photoCount++;
-        snprintf(editSavedName, sizeof(editSavedName), "EDIT_%04d.JPG", photoCount);
+        String fn = up.filename; fn.toUpperCase();
+        const char* ext = fn.endsWith(".GIF") ? "GIF" : fn.endsWith(".MP4") ? "MP4" : fn.endsWith(".WEBM") ? "WEBM" : "JPG";
+        snprintf(editSavedName, sizeof(editSavedName), "EDIT_%04d.%s", photoCount, ext);
         char path[36];
         snprintf(path, sizeof(path), "/%s", editSavedName);
         editUpFile = SD_MMC.open(path, FILE_WRITE);
@@ -2280,7 +2395,11 @@ void handleGallery() {
         while (f && fileCount < 512) {
             const char* n = f.name();
             int len = strlen(n);
-            if (len > 4 && (strcasecmp(n + len - 4, ".JPG") == 0 || strcasecmp(n + len - 4, ".AVI") == 0)) {
+            const char* e4 = (len > 4) ? n + len - 4 : "";
+            bool listed = len > 4 && (strcasecmp(e4, ".JPG") == 0 || strcasecmp(e4, ".AVI") == 0 ||
+                                      strcasecmp(e4, ".GIF") == 0 || strcasecmp(e4, ".MP4") == 0 ||
+                                      (len > 5 && strcasecmp(n + len - 5, ".WEBM") == 0));
+            if (listed) {
                 strncpy(fileNames[fileCount], n, 31);
                 fileNames[fileCount][31] = '\0';
                 fileCount++;
@@ -2357,17 +2476,44 @@ void handleGallery() {
         for (int fi = 0; fi < fileCount; fi++) {
             const char* n = fileNames[fi];
             int nl = strlen(n);
-            bool isAvi = nl > 4 && strcasecmp(n + nl - 4, ".AVI") == 0;
+            const char* ex = n + nl - 4;
+            bool isAvi = strcasecmp(ex, ".AVI") == 0;
+            bool isGif = strcasecmp(ex, ".GIF") == 0;
+            bool isVid = strcasecmp(ex, ".MP4") == 0 || (nl > 5 && strcasecmp(n + nl - 5, ".WEBM") == 0);
             if (isAvi) {
                 snprintf(card, sizeof(card),
                     "<div class='card' id='c_%s'>"
                     "<div class='thumb vid'>&#9654; VIDEO</div>"
                     "<div class='name'>%s</div>"
                     "<div class='acts'>"
+                    "<a class='ae' href='/editor?file=%s'>edit</a>"
                     "<a class='ab' href='/sd/%s'>save</a>"
                     "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
                     "</div></div>",
-                    n, n, n, n
+                    n, n, n, n, n
+                );
+            } else if (isVid) {
+                snprintf(card, sizeof(card),
+                    "<div class='card' id='c_%s'>"
+                    "<video class='thumb' src='/sd/%s' controls playsinline preload='metadata'></video>"
+                    "<div class='name'>%s</div>"
+                    "<div class='acts'>"
+                    "<a class='ab' href='/sd/%s' download>save</a>"
+                    "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
+                    "</div></div>",
+                    n, n, n, n, n
+                );
+            } else if (isGif) {
+                snprintf(card, sizeof(card),
+                    "<div class='card' id='c_%s'>"
+                    "<img class='thumb' src='/sd/%s' loading='lazy'"
+                    " onclick=\"window.open('/sd/%s')\">"
+                    "<div class='name'>%s</div>"
+                    "<div class='acts'>"
+                    "<a class='ab' href='/sd/%s' download>save</a>"
+                    "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
+                    "</div></div>",
+                    n, n, n, n, n, n
                 );
             } else {
                 snprintf(card, sizeof(card),
@@ -2419,9 +2565,14 @@ void handleSDFile() {
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) { server.send(500, "text/plain", "open error"); return; }
     server.sendHeader("Cache-Control", "max-age=86400, public");
-    bool avi = path.endsWith(".AVI") || path.endsWith(".avi");
-    if (avi) server.sendHeader("Content-Disposition", "attachment; filename=" + path.substring(1));
-    server.streamFile(f, avi ? "video/x-msvideo" : "image/jpeg");
+    String up = path; up.toUpperCase();
+    const char* ct = "image/jpeg";
+    if      (up.endsWith(".AVI"))  { ct = "video/x-msvideo";
+                                     server.sendHeader("Content-Disposition", "attachment; filename=" + path.substring(1)); }
+    else if (up.endsWith(".GIF"))  ct = "image/gif";
+    else if (up.endsWith(".MP4"))  ct = "video/mp4";
+    else if (up.endsWith(".WEBM")) ct = "video/webm";
+    server.streamFile(f, ct);
     f.close();
 }
 
