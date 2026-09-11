@@ -1,0 +1,3061 @@
+/*
+ *   ██████╗ ██╗██╗   ██╗
+ *   ██╔══██╗██║╚██╗ ██╔╝
+ *   ██║  ██║██║ ╚████╔╝
+ *   ██║  ██║██║  ╚██╔╝
+ *   ██████╔╝██║   ██║
+ *   ╚═════╝ ╚═╝   ╚═╝
+ *
+ *    ██████╗██╗   ██╗██████╗ ███████╗██████╗ ███████╗██╗  ██╗ ██████╗ ████████╗
+ *   ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔════╝██║  ██║██╔═══██╗╚══██╔══╝
+ *   ██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝███████╗███████║██║   ██║   ██║
+ *   ██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗╚════██║██╔══██║██║   ██║   ██║
+ *    ██████╗   ██║   ██████╔╝███████╗██║  ██║███████║██║  ██║╚██████╔╝   ██║
+ *    ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝    ╚═╝
+ *
+ *   CyberShot Cam — ESP32-S3 DIY Camera
+ *   @lixofuturista / @cebolander
+ */
+
+#include <Arduino.h>
+#include <JPEGDEC.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include "esp_camera.h"
+#include "img_converters.h"
+#include "SD_MMC.h"
+#include "esp_log.h"
+
+DNSServer    dnsServer;
+Preferences  wifiPrefs;
+bool         wifiSetup = false;   // true = captive portal ativo
+
+// TFT
+#define TFT_SCK  47
+#define TFT_SDA  45
+#define TFT_CS   43
+#define TFT_DC   14
+#define TFT_RST  21
+
+// Controles
+#define BTN_PIN  41
+#define JOY_X     1
+#define JOY_Y     2
+#define JOY_SW   42
+
+// Flash LED
+#define LED_FLASH   48
+
+// SD (hardwired GOOUUU V1.3)
+#define SD_CLK_PIN  39
+#define SD_CMD_PIN  38
+#define SD_D0_PIN   40
+
+// Camera
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   15
+#define SIOD_GPIO_NUM    4
+#define SIOC_GPIO_NUM    5
+#define Y9_GPIO_NUM     16
+#define Y8_GPIO_NUM     17
+#define Y7_GPIO_NUM     18
+#define Y6_GPIO_NUM     12
+#define Y5_GPIO_NUM     10
+#define Y4_GPIO_NUM      8
+#define Y3_GPIO_NUM      9
+#define Y2_GPIO_NUM     11
+#define VSYNC_GPIO_NUM   6
+#define HREF_GPIO_NUM    7
+#define PCLK_GPIO_NUM   13
+
+// Resolução de captura: XGA 1024×768
+#define FRAME_W  1024
+#define FRAME_H  768
+
+uint8_t* photoBuf   = nullptr;
+size_t   photoLen   = 0;
+bool     photoReady = false;
+int      photoCount = 0;
+
+bool wifiOK = false;
+bool wifiAP = false;  // true = rodando como Access Point
+bool sdOK   = false;
+
+enum AppState { STATE_VF, STATE_MENU, STATE_CONFIRM, STATE_VF_COLOR, STATE_EFFECTS, STATE_WIFI };
+
+static bool fxDQT    = false;
+static bool fxScan   = false;
+static bool fxChroma = false;
+static bool fxZigzag = false;
+static bool fxDHT    = false;
+static int  effectsSel  = 0;
+static int  wifiMenuSel = 0;
+static int  timerSecs  = 0;   // 0=off, 3, 5, 10
+static AppState appState     = STATE_VF;
+static int      menuSel      = 0;
+static int      confirmSel   = 1;
+static bool     vfNeedsClear = true;
+
+// paletas do viewfinder: 4 tons escuro→brilhante por cor
+const uint16_t vfPalettes[5][4] = {
+    { 0x00C0, 0x0260, 0x0480, 0x07C0 },  // 0 verde (default)
+    { 0x2000, 0x5000, 0x9000, 0xF800 },  // 1 vermelho
+    { 0x2804, 0x6009, 0xA050, 0xF8DC },  // 2 rosa
+    { 0x18C3, 0x4208, 0x8410, 0xFFFF },  // 3 branco
+    { 0x0106, 0x028C, 0x04D4, 0x07FF },  // 4 ciano
+};
+const char* VF_COLOR_NAMES[] = { "VERDE", "VERMELHO", "ROSA", "BRANCO", "CIANO" };
+static int  vfColorIdx   = 0;
+static int  leSeconds    = 0;   // 0=OFF, 3, 5, 10
+static int  evComp       = 0;    // compensação de exposição: -3 a +3 stops
+
+// ─── Auto-exposição ───────────────────────────────────────────────────────────
+// Valores calibrados pelo viewfinder, reaproveitados na captura (ver captureExposureFromVf).
+static int  vfAecValue  = 600;   // 0–1200 (linhas de exposição manual)
+static int  vfAgcGain   = 15;    // 0–30   (ganho manual)
+static int  vfFrameCnt  = 0;     // contador interno para ajuste periódico
+
+static const int LUMA_TARGET = 5000;  // alvo de luma médio (~36 % do max 13698)
+static const int LUMA_HYST   = 700;   // faixa de tolerância (evita oscilação)
+
+// Mede luma média do frame raw do viewfinder (big-endian RGB565, OV2640 output).
+// Amostra 1 pixel a cada 32 para não custar tempo no loop principal.
+int measureLuma(const uint8_t* buf, int w, int h) {
+    uint32_t sum   = 0;
+    int      count = 0;
+    for (int i = 0; i < w * h * 2; i += 64) {
+        uint8_t hi = buf[i], lo = buf[i + 1];
+        uint8_t r = hi >> 3;
+        uint8_t g = ((hi & 0x07) << 3) | (lo >> 5);
+        uint8_t b = lo & 0x1F;
+        sum += (uint32_t)r * 54 + (uint32_t)g * 182 + (uint32_t)b * 18;
+        count++;
+    }
+    return count ? (int)(sum / count) : 0;
+}
+
+static void dlog(const char* fmt, ...);   // log em RAM (definido na seção "Log em RAM")
+
+// Alvo de luma com a compensação EV aplicada (usado pelo VF e pela medição da foto).
+static int aeTarget() {
+    if (evComp > 0) return min(13000, LUMA_TARGET << evComp);
+    if (evComp < 0) return max(200,   LUMA_TARGET >> (-evComp));
+    return LUMA_TARGET;
+}
+
+// Ajusta vfAecValue/vfAgcGain para atingir LUMA_TARGET e aplica imediatamente ao sensor.
+// Estratégia em dois estágios: primeiro esgota aec_value, depois toca gain (e vice-versa).
+void autoExposure(int avgLuma) {
+    int target = aeTarget();
+    int diff = avgLuma - target;
+    if (abs(diff) < LUMA_HYST) return;
+
+    // step proporcional ao erro: longe do alvo = salto maior, perto = refinamento
+    int aecStep  = constrain(abs(diff) / 4, 100, 600);
+    int gainStep = constrain(abs(diff) / 600, 1, 6);
+    bool changed = false;
+
+    if (diff < 0) {  // muito escuro → aumenta exposição
+        if (vfAecValue < 1200) {
+            vfAecValue = min(1200, vfAecValue + aecStep);
+            changed = true;
+        } else if (vfAgcGain < 30) {
+            vfAgcGain = min(30, vfAgcGain + gainStep);
+            changed = true;
+        }
+    } else {  // muito brilhante → reduz exposição
+        if (vfAgcGain > 0) {
+            vfAgcGain = max(0, vfAgcGain - gainStep);
+            changed = true;
+        } else if (vfAecValue > 50) {
+            vfAecValue = max(50, vfAecValue - aecStep);
+            changed = true;
+        }
+    }
+    if (changed) {
+        dlog("[AE] luma %d -> aec %d g %d", avgLuma, vfAecValue, vfAgcGain);
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) {
+            s->set_aec_value(s, vfAecValue);
+            s->set_agc_gain(s, vfAgcGain);
+        }
+    }
+}
+
+void applyVfExposure() {
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return;
+    s->set_aec_value(s, vfAecValue);
+    s->set_agc_gain(s, vfAgcGain);
+}
+
+const uint16_t gbPalette[4] = {0x00C0, 0x0260, 0x0480, 0x07C0};
+
+SPIClass        tftSPI(FSPI);
+Adafruit_ST7735 tft(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
+WebServer server(80);
+
+// ─── Log em RAM ──────────────────────────────────────────────────────────────
+// GPIO43 (TX0) é o CS do display: o serial USB só recebe lixo do SPI. O log fica
+// num ring em RAM, aparece na tela quando a captura falha e em http://<ip>/log.
+// esp_log_set_vprintf captura também os erros internos do driver da câmera.
+
+static const int LOG_LINES = 64;
+static const int LOG_W     = 64;
+// .noinit: sobrevive a ESP.restart()/panic/WDT (não a desligar) — o /log após um reinício
+// mostra o que aconteceu antes dele. Validado por magic no setup().
+static const uint32_t LOG_MAGIC = 0xC5B0106A;
+__NOINIT_ATTR static uint32_t logMagic;
+__NOINIT_ATTR static char     logRing[LOG_LINES][LOG_W];
+__NOINIT_ATTR static int      logHead;
+__NOINIT_ATTR static int      logCount;
+static portMUX_TYPE  logMux   = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t logOrigVprintf = nullptr;
+
+static void logPush(const char* s) {
+    char line[LOG_W];
+    int n = 0;
+    for (const char* p = s; *p && n < LOG_W - 1; p++) {
+        if (*p == '\r' || *p == '\n') continue;
+        if (*p == 0x1B) { while (*p && *p != 'm') p++; if (!*p) break; continue; }  // cores ANSI
+        line[n++] = *p;
+    }
+    line[n] = '\0';
+    if (n == 0) return;
+    portENTER_CRITICAL(&logMux);
+    memcpy(logRing[logHead], line, LOG_W);
+    logHead = (logHead + 1) % LOG_LINES;
+    if (logCount < LOG_LINES) logCount++;
+    portEXIT_CRITICAL(&logMux);
+}
+
+static void dlog(const char* fmt, ...) {
+    char buf[LOG_W + 32];
+    unsigned long ms = millis();
+    int n = snprintf(buf, sizeof(buf), "%lu.%lu ", ms / 1000, (ms / 100) % 10);   // segundos desde o boot
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+    logPush(buf);
+    Serial.println(buf);
+}
+
+static int logVprintf(const char* fmt, va_list ap) {
+    char buf[160];
+    va_list ap2; va_copy(ap2, ap);
+    vsnprintf(buf, sizeof(buf), fmt, ap2);
+    va_end(ap2);
+    logPush(buf);
+    return logOrigVprintf ? logOrigVprintf(fmt, ap) : (int)strlen(buf);
+}
+
+// copia a linha i (0 = mais antiga) para out[LOG_W]; false se não existe
+static bool logGet(int i, char* out) {
+    portENTER_CRITICAL(&logMux);
+    bool ok = (i >= 0 && i < logCount);
+    if (ok) memcpy(out, logRing[(logHead - logCount + i + LOG_LINES) % LOG_LINES], LOG_W);
+    portEXIT_CRITICAL(&logMux);
+    return ok;
+}
+
+// ─── Câmera ───────────────────────────────────────────────────────────────────
+
+// O sensor é configurado UMA vez no boot (JPEG XGA) e nunca mais é resetado ou
+// reconfigurado: log 2026-09-11 — após esp_camera_deinit/init (soft-reset) o OV2640
+// aceita toda a programação via SCCB mas não gera VSYNC (2 de 9 reinit entregaram
+// frames). Viewfinder e foto usam o MESMO frame XGA: o VF decodifica a 1/8 (128×96,
+// só DC — rápido) e amplia para 160×120; a foto é o próximo frame. Únicas escritas no
+// sensor em operação: aec/ganho (AE, EV) e AE auto on/off (long exposure).
+static const framesize_t CAP_SIZE = FRAMESIZE_XGA;     // 1024×768
+
+// Exposição manual do VF/foto (também desliga o AE automático deixado pela long exposure).
+static void camApplyVfExposure() {
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return;
+    s->set_exposure_ctrl(s, 0);
+    s->set_gain_ctrl(s, 0);
+    s->set_aec_value(s, vfAecValue);
+    s->set_agc_gain(s, vfAgcGain);
+}
+
+// true se o pino VSYNC mudou de nível dentro de `ms` (sensor está gerando frames).
+// No S3 o driver lê VSYNC pelo periférico LCD_CAM, não por interrupção de GPIO — ler o
+// pino diretamente não interfere. gpio_get_level (IDF), não digitalRead: o Arduino 3.x
+// devolve 0 para pinos que não passaram por pinMode(), e este foi configurado pelo driver.
+static bool camVsyncAlive(int ms) {
+    const gpio_num_t pin = (gpio_num_t)VSYNC_GPIO_NUM;
+    int last = gpio_get_level(pin);
+    unsigned long t0 = millis();
+    while (millis() - t0 < (unsigned long)ms) {
+        if (gpio_get_level(pin) != last) return true;
+        delayMicroseconds(200);
+    }
+    return false;
+}
+
+// Descarta n frames (antigos na fila / em andamento). Para no 1º NULL.
+static void camDropFrames(int n) {
+    for (int i = 0; i < n; i++) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) return;
+        esp_camera_fb_return(fb);
+    }
+}
+
+// SCCB: fica com o barramento do próprio driver (100 kHz). Um barramento criado pelo
+// firmware a 50 kHz e entregue via sccb_i2c_port foi testado em 11/09 e quebrou o modo
+// JPEG (sensor sem VSYNC após o init) — não repetir.
+// Recuperação I2C (spec): 9 pulsos de SCL + STOP com os pinos em GPIO. Só é chamada quando
+// o init falhou (o driver já liberou os pinos); o retry reinstala o SCCB do driver.
+static void sccbBusRecover() {
+    const gpio_num_t scl = (gpio_num_t)SIOC_GPIO_NUM;
+    const gpio_num_t sda = (gpio_num_t)SIOD_GPIO_NUM;
+    gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
+    gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+    gpio_set_level(sda, 1);
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(scl, 0); delayMicroseconds(10);
+        gpio_set_level(scl, 1); delayMicroseconds(10);
+    }
+    gpio_set_level(sda, 0); delayMicroseconds(10);   // STOP: SDA↓ com SCL↑, depois SDA↑
+    gpio_set_level(sda, 1); delayMicroseconds(10);
+    dlog("[SCCB] bus recover");
+}
+
+bool initCamera() {
+    esp_camera_deinit();
+    delay(50);
+
+    camera_config_t cfg = {};
+    cfg.ledc_channel  = LEDC_CHANNEL_0;
+    cfg.ledc_timer    = LEDC_TIMER_0;
+    cfg.pin_d0        = Y2_GPIO_NUM;
+    cfg.pin_d1        = Y3_GPIO_NUM;
+    cfg.pin_d2        = Y4_GPIO_NUM;
+    cfg.pin_d3        = Y5_GPIO_NUM;
+    cfg.pin_d4        = Y6_GPIO_NUM;
+    cfg.pin_d5        = Y7_GPIO_NUM;
+    cfg.pin_d6        = Y8_GPIO_NUM;
+    cfg.pin_d7        = Y9_GPIO_NUM;
+    cfg.pin_xclk      = XCLK_GPIO_NUM;
+    cfg.pin_pclk      = PCLK_GPIO_NUM;
+    cfg.pin_vsync     = VSYNC_GPIO_NUM;
+    cfg.pin_href      = HREF_GPIO_NUM;
+    cfg.pin_sccb_sda  = SIOD_GPIO_NUM;
+    cfg.pin_sccb_scl  = SIOC_GPIO_NUM;
+    cfg.pin_pwdn      = PWDN_GPIO_NUM;
+    cfg.pin_reset     = RESET_GPIO_NUM;
+
+    // 10 MHz: em XGA (modo UXGA do sensor) aec 1200 ≈ 1/8 s e ~8 fps — foi o que rodou
+    // estável (VF 9 fps, fotos iguais ao VF) no build de XGA fixo.
+    cfg.xclk_freq_hz = 10000000;
+
+    cfg.pixel_format = PIXFORMAT_JPEG;
+    // O driver dimensiona o frame buffer JPEG por w*h/5 do frame_size do init. XGA daria
+    // ~154 KB e estoura com ruído de ganho alto (frame descartado, sem EOI). Inicia em UXGA
+    // (~375 KB × 2) e reduz para XGA com set_framesize — uma única vez, aqui.
+    cfg.frame_size   = FRAMESIZE_UXGA;
+    cfg.jpeg_quality = 12;
+    cfg.fb_count     = 2;
+    cfg.grab_mode    = CAMERA_GRAB_LATEST;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+
+    unsigned long t0 = millis();
+    esp_err_t err = esp_camera_init(&cfg);
+    if (err != ESP_OK) {
+        dlog("[CAM] init fail 0x%x", err);
+        sccbBusRecover();
+        delay(300);
+        err = esp_camera_init(&cfg);
+        if (err != ESP_OK) {
+            dlog("[CAM] init fail2 0x%x", err);
+            return false;
+        }
+    }
+    delay(200);
+
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) {
+        s->set_framesize(s, CAP_SIZE);   // única troca de resolução: aqui, logo após o soft-reset
+        delay(150);
+        s->set_hmirror(s, 1);
+        s->set_brightness(s, 1);
+        s->set_gainceiling(s, GAINCEILING_128X);
+        s->set_whitebal(s, 1);    // AWB sempre ligado: o VF só usa luma, a foto precisa
+        s->set_awb_gain(s, 1);
+        s->set_wb_mode(s, 0);
+    }
+    camApplyVfExposure();
+    dlog("[CAM] init ok %lums", millis() - t0);
+    return true;
+}
+
+// ─── Viewfinder / VF ─────────────────────────────────────────────────────────
+
+void toGreenTones(uint8_t* buf, int w, int h) {
+    const uint16_t* pal = vfPalettes[vfColorIdx];
+    for (int i = 0, total = w * h * 2; i < total; i += 2) {
+        uint8_t hi = buf[i], lo = buf[i + 1];
+        uint8_t r  = hi >> 3;
+        uint8_t g  = ((hi & 0x07) << 3) | (lo >> 5);
+        uint8_t b  = lo & 0x1F;
+        uint16_t luma = (uint16_t)r * 54 + (uint16_t)g * 182 + (uint16_t)b * 18;
+        uint8_t  tone = (uint8_t)(luma >> 12);
+        if (tone > 3) tone = 3;
+        uint16_t px = pal[tone];
+        buf[i]     = px >> 8;
+        buf[i + 1] = px & 0xFF;
+    }
+}
+
+// Barra de compensação de exposição: 7 posições (-3 a +3) no rodapé do VF.
+// Desenhada dentro da área do viewfinder → sobrescrita pelo próximo frame.
+void drawEvBar() {
+    const int Y    = 109;
+    const int STEP = 21;   // px entre posições
+    const int X0   = 17;   // x da posição ev=-3
+
+    uint16_t dim = vfPalettes[vfColorIdx][1];
+    uint16_t mid = vfPalettes[vfColorIdx][2];
+    uint16_t bri = vfPalettes[vfColorIdx][3];
+
+    tft.fillRect(0, Y - 1, 160, 14, ST77XX_BLACK);
+
+    for (int e = -3; e <= 3; e++) {
+        int x = X0 + (e + 3) * STEP;
+        if (e == evComp) {
+            tft.fillRect(x - 4, Y, 9, 11, evComp > 0 ? bri : dim);
+        } else if (e == 0) {
+            tft.drawRect(x - 3, Y + 1, 7, 9, mid);
+        } else {
+            tft.drawFastVLine(x, Y + 2, 7, dim);
+        }
+    }
+
+    // valor numérico no canto direito
+    char txt[5];
+    snprintf(txt, sizeof(txt), evComp > 0 ? "+%d" : "%d", evComp);
+    tft.setTextSize(1);
+    tft.setTextColor(evComp > 0 ? bri : dim);
+    tft.setCursor(149, Y + 2);
+    tft.print(txt);
+}
+
+void drawViewfinderOverlay() {
+    uint16_t c = vfPalettes[vfColorIdx][3];
+    int m = 8;
+    tft.drawFastHLine(0,       0,       m, c);
+    tft.drawFastVLine(0,       0,       m, c);
+    tft.drawFastHLine(160 - m, 0,       m, c);
+    tft.drawFastVLine(159,     0,       m, c);
+    tft.drawFastHLine(0,       127,     m, c);
+    tft.drawFastVLine(0,       127 - m, m, c);
+    tft.drawFastHLine(160 - m, 127,     m, c);
+    tft.drawFastVLine(159,     127 - m, m, c);
+    tft.drawFastHLine(76, 64, 8, c);
+    tft.drawFastVLine(79, 61, 6, c);
+
+    tft.setTextSize(1);
+
+    // indicadores de modo (canto superior)
+    if (leSeconds > 0) {
+        tft.setTextColor(vfPalettes[vfColorIdx][2]);
+        tft.setCursor(2, 2);
+        char leLabel[6];
+        snprintf(leLabel, sizeof(leLabel), "L%dS", leSeconds);
+        tft.print(leLabel);
+    }
+    // barra de EV — desenhada aqui para garantir que fica por cima do frame
+    if (evComp != 0) drawEvBar();
+
+    static bool _wifi = false;
+    static bool _ap   = false;
+    if (wifiOK == _wifi && wifiAP == _ap) return;
+    _wifi = wifiOK;
+    _ap   = wifiAP;
+    tft.setTextSize(1);
+    tft.setCursor(118, 120);
+    if (!wifiOK) {
+        tft.setTextColor(ST77XX_RED);   tft.print("----");
+    } else if (wifiAP) {
+        tft.setTextColor(ST77XX_CYAN);  tft.print(" AP ");
+    } else {
+        tft.setTextColor(ST77XX_GREEN); tft.print("WiFi");
+    }
+}
+
+// ─── Declarações antecipadas ─────────────────────────────────────────────────
+
+void handleRoot();
+void handleFoto();
+void handleGallery();
+void handleEditor();
+void handleDelete();
+void handleSDFile();
+void handleSaveEdit();
+void handleSaveEditUpload();
+void handleLog();
+
+void setupWebServer();   // forward declaration
+
+// ─── NVS: salvar/carregar credenciais ────────────────────────────────────────
+
+void saveWiFiCreds(const String& ssid, const String& pass) {
+    wifiPrefs.begin("wifi", false);
+    wifiPrefs.putString("ssid", ssid);
+    wifiPrefs.putString("pass", pass);
+    wifiPrefs.end();
+}
+
+bool loadWiFiCreds(String& ssid, String& pass) {
+    wifiPrefs.begin("wifi", true);
+    ssid = wifiPrefs.getString("ssid", "");
+    pass = wifiPrefs.getString("pass", "");
+    wifiPrefs.end();
+    return ssid.length() > 0;
+}
+
+void clearWiFiCreds() {
+    wifiPrefs.begin("wifi", false);
+    wifiPrefs.clear();
+    wifiPrefs.end();
+}
+
+// ─── Captive portal ──────────────────────────────────────────────────────────
+
+void handleSetupPage() {
+    // Escaneia redes disponíveis
+    int n = WiFi.scanNetworks();
+    String nets = "";
+    for (int i = 0; i < n; i++) {
+        String s = WiFi.SSID(i);
+        int    r = WiFi.RSSI(i);
+        String bars = r > -60 ? "▊▊▊" : r > -75 ? "▊▊░" : "▊░░";
+        s.replace("\"", "&quot;");
+        nets += "<div class='n' onclick='pick(this)' data-s='" + s + "'>"
+              + s + "<span>" + bars + " " + String(r) + "dBm</span></div>";
+    }
+    WiFi.scanDelete();
+
+    String html = R"(<!DOCTYPE html><html><head>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<meta charset='utf-8'>
+<title>CyberShot WiFi</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:sans-serif;background:#0a0a0a;color:#ddd;max-width:420px;margin:0 auto;padding:16px}
+h1{color:#00ff88;font-size:1.1em;margin:0 0 4px}
+p{color:#666;font-size:.85em;margin:0 0 12px}
+.n{padding:12px;margin:4px 0;background:#1a1a1a;border-radius:8px;cursor:pointer;
+   border:2px solid transparent;display:flex;justify-content:space-between;align-items:center}
+.n span{font-size:.75em;color:#666}
+.n.sel{border-color:#00ff88;background:#0d1f14}
+input{width:100%;padding:12px;margin:8px 0 16px;background:#1a1a1a;color:#ddd;
+      border:1px solid #333;border-radius:8px;font-size:1em}
+button{width:100%;padding:14px;background:#00ff88;color:#000;font-weight:700;
+       border:none;border-radius:8px;font-size:1em;cursor:pointer}
+#st{margin-top:12px;text-align:center;min-height:20px;font-size:.9em}
+.ok{color:#00ff88}.err{color:#ff4444}
+</style></head><body>
+<h1>CyberShot WiFi Setup</h1>
+<p>Select your network and enter the password:</p>
+)" + nets + R"(
+<input type='password' id='pw' placeholder='Password' autocomplete='current-password'>
+<button onclick='go()'>Connect</button>
+<div id='st'></div>
+<script>
+var sel='';
+function pick(el){
+  document.querySelectorAll('.n').forEach(function(e){e.classList.remove('sel')});
+  el.classList.add('sel'); sel=el.dataset.s;
+}
+function go(){
+  if(!sel){document.getElementById('st').innerHTML='<span class=err>Select a network first</span>';return}
+  var pw=document.getElementById('pw').value;
+  document.getElementById('st').innerHTML='Connecting to <b>'+sel+'</b>...';
+  fetch('/configure',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'ssid='+encodeURIComponent(sel)+'&pass='+encodeURIComponent(pw)
+  }).then(function(r){return r.text()}).then(function(t){
+    if(t.startsWith('OK:')){
+      var ip=t.slice(3);
+      document.getElementById('st').innerHTML='<span class=ok>Connected! Open <a href="http://'+ip+'" style="color:#00ff88">http://'+ip+'</a> to use the camera.</span>';
+    } else {
+      document.getElementById('st').innerHTML='<span class=err>Failed — wrong password?</span>';
+    }
+  }).catch(function(){
+    document.getElementById('st').innerHTML='<span class=ok>Connected! Check your camera IP.</span>';
+  });
+}
+</script></body></html>)";
+
+    server.send(200, "text/html", html);
+}
+
+void handleConfigure() {
+    if (!server.hasArg("ssid")) { server.send(400, "text/plain", "missing ssid"); return; }
+    String newSsid = server.arg("ssid");
+    String newPass = server.arg("pass");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(newSsid.c_str(), newPass.c_str());
+
+    unsigned long t = millis();
+    while (millis() - t < 12000 && WiFi.status() != WL_CONNECTED) {
+        dnsServer.processNextRequest();
+        delay(100);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        String ip = WiFi.localIP().toString();
+        server.send(200, "text/plain", "OK:" + ip);
+        delay(200);
+
+        saveWiFiCreds(newSsid, newPass);
+        dnsServer.stop();
+        wifiSetup = false;
+        wifiOK    = true;
+        wifiAP    = false;
+        server.stop();
+        delay(200);
+        setupWebServer();
+
+        // Atualiza TFT com IP
+        tft.fillRect(0, 88, 160, 8, ST77XX_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_GREEN);
+        tft.setCursor(8, 88);
+        tft.printf("IP: %s", ip.c_str());
+        vfNeedsClear = true;
+    } else {
+        // Falhou — volta ao AP de setup
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP("CyberShot-Setup");
+        server.send(200, "text/plain", "FAIL");
+    }
+}
+
+void startWiFiPortal() {
+    server.stop();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("CyberShot-Setup");
+
+    dnsServer.start(53, "*", WiFi.softAPIP());
+
+    server.on("/",          handleSetupPage);
+    server.on("/configure", HTTP_POST, handleConfigure);
+    server.onNotFound([](){ server.sendHeader("Location","http://192.168.4.1/",true); server.send(302,"text/plain",""); });
+    server.begin();
+
+    wifiSetup = true;
+    wifiOK    = false;
+    wifiAP    = false;
+
+    // TFT: instrução
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(0x07E0);
+    tft.setCursor(8, 30); tft.print("WiFi Setup:");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(8, 45); tft.print("Connect to:");
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(8, 55); tft.print("CyberShot-Setup");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(8, 70); tft.print("then open browser");
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(8, 85); tft.print("192.168.4.1");
+    tft.setTextColor(0x2965);
+    tft.setCursor(4, 120); tft.print("[HOLD] cancel");
+}
+
+// ─── Web server (modo câmera normal) ─────────────────────────────────────────
+
+void setupWebServer() {
+    if (!wifiAP) MDNS.begin("cybershot");  // mDNS só em STA; em AP consome heap sem uso
+    server.on("/",          handleRoot);
+    server.on("/foto",      handleFoto);
+    server.on("/galeria",   handleGallery);
+    server.on("/editor",    handleEditor);
+    server.on("/delete",    handleDelete);
+    server.on("/save-edit", HTTP_POST, handleSaveEdit, handleSaveEditUpload);
+    server.on("/log",       handleLog);
+    server.onNotFound(handleSDFile);
+    server.begin();
+    IPAddress ip = wifiAP ? WiFi.softAPIP() : WiFi.localIP();
+    dlog("[WEB] http://%s", ip.toString().c_str());
+}
+
+// Tenta STA com credenciais salvas na NVS. Se não houver ou falhar, fica offline.
+// Exibe status no TFT (chamada dentro de setup(), linha y=50).
+void setupWiFi() {
+    tft.setTextSize(1);
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(8, 50); tft.print("WIFI ...");
+
+    String ssid, pass;
+    if (!loadWiFiCreds(ssid, pass)) {
+        tft.fillRect(0, 50, 160, 8, ST77XX_BLACK);
+        tft.setTextColor(ST77XX_YELLOW);
+        tft.setCursor(8, 50);
+        tft.print("WIFI not configured");
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    WiFi.setTxPower(WIFI_POWER_15dBm);   // menos pico de corrente no rádio (hipótese: quedas de tensão travam o OV2640)
+    unsigned long t = millis();
+    while (millis() - t < 10000 && WiFi.status() != WL_CONNECTED) delay(200);
+
+    tft.fillRect(0, 50, 160, 8, ST77XX_BLACK);
+    tft.setCursor(8, 50);
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiOK = true;
+        wifiAP = false;
+        setupWebServer();
+        tft.setTextColor(ST77XX_GREEN);
+        tft.printf("WIFI %s", WiFi.localIP().toString().c_str());
+    } else {
+        WiFi.disconnect(true);
+        dlog("[WIFI] fail");
+        tft.setTextColor(ST77XX_YELLOW);
+        tft.print("WIFI failed");
+    }
+}
+
+// ─── SD ──────────────────────────────────────────────────────────────────────
+
+bool saveToSD(const uint8_t* buf, size_t len, char* nameOut) {
+    if (!sdOK) return false;
+    do {
+        photoCount++;
+        sprintf(nameOut, "/PHOTO_%04d.JPG", photoCount);
+    } while (SD_MMC.exists(nameOut) && photoCount < 9999);
+    File f = SD_MMC.open(nameOut, FILE_WRITE);
+    if (!f) return false;
+    f.write(buf, len);
+    f.close();
+    return true;
+}
+
+// ─── Glitch: erosão de frequência DQT ────────────────────────────────────────
+// Fator de intensidade do glitch baseado na exposição atual (0=sutil, 1=agressivo).
+static float glitchFactor() {
+    float aec  = (float)vfAecValue / 1200.0f;
+    float gain = (float)vfAgcGain  / 30.0f;
+    return constrain(aec * 0.35f + gain * 0.65f, 0.05f, 0.95f);
+}
+
+// Modifica tabelas DQT do JPEG: freq baixas → quant=1 (amplifica), altas → quant=255 (apaga).
+void applyGlitchDQT(uint8_t* buf, size_t len) {
+    float gf = glitchFactor();
+
+    // corte de freq baixa: k=1..cutLow → quant=1 (gf alto = faixa maior)
+    int cutLow = (int)(gf * 19.0f);
+
+    // corte de freq alta: k=cutHi..63 → quant=255 (gf alto = faixa maior)
+    int cutHi = 63 - (int)(gf * 31.0f);
+
+    int i = 0;
+    while (i < (int)len - 4) {
+        if (buf[i] != 0xFF || buf[i + 1] != 0xDB) { i++; continue; }
+
+        int segEnd = i + 2 + ((buf[i + 2] << 8) | buf[i + 3]);
+        if (segEnd > (int)len) break;
+
+        int pos = i + 4;
+        while (pos < segEnd - 1) {
+            int precision  = (buf[pos] >> 4) & 0x0F;
+            int tableBytes = precision ? 128 : 64;
+            pos++;
+            if (pos + tableBytes > segEnd) break;
+
+            for (int k = 0; k < 64; k++) {
+                uint8_t newVal = 0;
+                if      (k == 0)              newVal = buf[pos];   // DC: preserva
+                else if (k <= cutLow)         newVal = 1;          // baixa freq: amplifica
+                else if (k >= cutHi)          newVal = 255;        // alta freq: apaga
+                else                          newVal = buf[pos];   // transição: preserva
+
+                if (precision) {
+                    buf[pos]     = 0;
+                    buf[pos + 1] = newVal;
+                    pos += 2;
+                } else {
+                    buf[pos] = newVal;
+                    pos++;
+                }
+            }
+        }
+
+        i = segEnd;
+    }
+}
+
+// ─── Glitch: transplante de dados de scan ────────────────────────────────────
+// Sobrescreve trechos do bitstream de scan com dados de outra região → dessincroniza Huffman → artefatos VHS.
+void applyGlitchScan(uint8_t* buf, size_t len) {
+    // localiza dados de scan (SOS)
+    int scanStart = -1;
+    for (int i = 0; i < (int)len - 3; i++) {
+        if (buf[i] == 0xFF && buf[i + 1] == 0xDA) {
+            scanStart = i + 2 + ((buf[i + 2] << 8) | buf[i + 3]);
+            break;
+        }
+    }
+    if (scanStart < 0) return;
+
+    // fim do scan (EOI)
+    int scanEnd = (int)len - 2;
+    for (int i = (int)len - 2; i >= scanStart; i--) {
+        if (buf[i] == 0xFF && buf[i + 1] == 0xD9) { scanEnd = i; break; }
+    }
+    int scanLen = scanEnd - scanStart;
+    if (scanLen < 512) return;
+
+    // parâmetros aleatórios (RNG de hardware do ESP32)
+    uint32_t rng = esp_random();
+    int nTransplants = 2   + (int)((rng & 0xFF)         % 3);       // 2..4
+    int divisor      = 8   + (int)(((rng >> 8)  & 0xFF) % 11);      // 8..18
+    int donorPct     = 25  + (int)(((rng >> 16) & 0xFF) % 26);      // 25..50
+
+    float aecNorm  = (float)vfAecValue / 1200.0f;
+    float gainNorm = (float)vfAgcGain  / 30.0f;
+
+    int tLen      = constrain(scanLen / divisor, 64, 4096);
+    int donorOff  = (int)((float)scanLen * donorPct / 100.0f);
+
+    Serial.printf("[glitch] transplants=%d  divisor=/%d  donor=%d%%\n",
+                  nTransplants, divisor, donorPct);
+
+    // aplica os transplantes
+    for (int t = 0; t < nTransplants; t++) {
+        float base = (float)t / nTransplants
+                   + (t % 2 == 0 ? aecNorm : gainNorm) * (1.0f / nTransplants * 0.6f);
+        int r = scanStart + (int)(base * (scanLen - tLen));
+        int d = scanStart + ((r - scanStart + donorOff) % scanLen);
+        int l = tLen;
+        if (r + l > scanEnd) l = scanEnd - r;
+        if (l > 0 && d + l <= scanEnd)
+            memcpy(buf + r, buf + d, l);
+    }
+}
+
+// ─── Glitch: amplificação de croma DQT ───────────────────────────────────────
+// Manipula só a tabela de crominância (ID=1): cores explodem sem afetar nitidez/luminância.
+void applyGlitchChroma(uint8_t* buf, size_t len) {
+    float aecNorm  = (float)vfAecValue / 1200.0f;
+    float gainNorm = (float)vfAgcGain  / 30.0f;
+    float darkness = aecNorm * 0.4f + gainNorm * 0.6f;  // 0=bright, 1=dark
+
+    // amplifica faixa AC de croma média (k=kMidLo..kMidHi) + DC moderado
+    int kMidLo = 4;
+    int kMidHi = 18 + (int)(darkness * 10.0f);  // 18..28
+    int dcVal  = 162 + (int)(darkness * 18.0f);  // 162..180  (-10%)
+    int acVal  = 198 + (int)(darkness * 32.0f);  // 198..230  (-10%)
+
+    Serial.printf("[glitch] chroma dc=%d ac=%d kMid=%d..%d darkness=%.2f\n",
+                  dcVal, acVal, kMidLo, kMidHi, darkness);
+
+    // varre tabelas DQT para identificar se existe tabela de croma (ID=1)
+    bool hasChromaTable = false;
+    int  tablesFound    = 0;
+    int  i = 0;
+    while (i < (int)len - 4) {
+        if (buf[i] != 0xFF || buf[i + 1] != 0xDB) { i++; continue; }
+        int segEnd = i + 2 + ((buf[i + 2] << 8) | buf[i + 3]);
+        if (segEnd > (int)len) break;
+        int pos = i + 4;
+        while (pos < segEnd - 1) {
+            int precision  = (buf[pos] >> 4) & 0x0F;
+            int tableId    =  buf[pos] & 0x0F;
+            int tableBytes = precision ? 128 : 64;
+            Serial.printf("[glitch] DQT tableId=%d precision=%d\n", tableId, precision);
+            if (tableId == 1) hasChromaTable = true;
+            tablesFound++;
+            pos += 1 + tableBytes;
+        }
+        i = segEnd;
+    }
+    Serial.printf("[glitch] tables=%d hasChroma=%d\n", tablesFound, hasChromaTable);
+
+    // aplica só na tabela de crominância (ID=1) se existir, senão em todas
+    i = 0;
+    while (i < (int)len - 4) {
+        if (buf[i] != 0xFF || buf[i + 1] != 0xDB) { i++; continue; }
+        int segEnd = i + 2 + ((buf[i + 2] << 8) | buf[i + 3]);
+        if (segEnd > (int)len) break;
+
+        int pos = i + 4;
+        while (pos < segEnd - 1) {
+            int precision  = (buf[pos] >> 4) & 0x0F;
+            int tableId    =  buf[pos] & 0x0F;
+            int tableBytes = precision ? 128 : 64;
+            pos++;
+            if (pos + tableBytes > segEnd) break;
+
+            bool modify = hasChromaTable ? (tableId == 1) : true;
+
+            if (modify) {
+                for (int k = 0; k < 64; k++) {
+                    uint8_t newVal = 0;
+                    if (k == 0)                        newVal = (uint8_t)dcVal;   // DC: moderate boost
+                    else if (k >= kMidLo && k <= kMidHi) newVal = (uint8_t)acVal; // mid-freq AC: strong
+                    // demais k: preserva valor original
+
+                    if (newVal > 0) {
+                        if (precision) {
+                            buf[pos]     = 0;
+                            buf[pos + 1] = newVal;
+                        } else {
+                            buf[pos] = newVal;
+                        }
+                    }
+                    pos += precision ? 2 : 1;
+                }
+            } else {
+                pos += tableBytes;
+            }
+        }
+        i = segEnd;
+    }
+}
+
+// ─── Glitch: permutação zigzag DQT ───────────────────────────────────────────
+// Rotaciona circularmente os 63 valores AC da tabela DQT: troca quant de freq baixa/alta → posterização + emboss.
+void applyGlitchZigzag(uint8_t* buf, size_t len) {
+    float gf     = glitchFactor();
+    int rotation = 4 + (int)(gf * 37.0f);  // 4..41  (-15% vs 5..49)
+
+    int i = 0;
+    while (i < (int)len - 4) {
+        if (buf[i] != 0xFF || buf[i + 1] != 0xDB) { i++; continue; }
+
+        int segEnd = i + 2 + ((buf[i + 2] << 8) | buf[i + 3]);
+        if (segEnd > (int)len) break;
+
+        int pos = i + 4;
+        while (pos < segEnd - 1) {
+            int precision  = (buf[pos] >> 4) & 0x0F;
+            int tableBytes = precision ? 128 : 64;
+            pos++;
+            if (pos + tableBytes > segEnd) break;
+
+            // copia AC antes de modificar
+            uint8_t tmp[63];
+            for (int k = 0; k < 63; k++)
+                tmp[k] = precision ? buf[pos + (k + 1) * 2 + 1] : buf[pos + k + 1];
+
+            // escreve de volta com rotação circular
+            for (int k = 0; k < 63; k++) {
+                int src = (k + rotation) % 63;
+                if (precision) {
+                    buf[pos + (k + 1) * 2]     = 0;
+                    buf[pos + (k + 1) * 2 + 1] = tmp[src];
+                } else {
+                    buf[pos + k + 1] = tmp[src];
+                }
+            }
+
+            pos += tableBytes;
+        }
+        i = segEnd;
+    }
+}
+
+// ─── Glitch: rotação de run-length DHT ───────────────────────────────────────
+// Rotaciona símbolos AC Huffman dentro de cada grupo de magnitude: desloca coeficientes DCT → distorção estrutural.
+void applyGlitchDHT(uint8_t* buf, size_t len) {
+    float gf        = glitchFactor();
+    int   rotLuma   = constrain(1 + (int)(gf * 5.0f), 1, 6);
+    int   rotChroma = constrain(rotLuma - 1, 1, 3);
+
+    int i = 0;
+    while (i < (int)len - 4) {
+        if (buf[i] != 0xFF || buf[i + 1] != 0xC4) { i++; continue; }
+
+        int segEnd = i + 2 + ((buf[i + 2] << 8) | buf[i + 3]);
+        if (segEnd > (int)len) break;
+
+        int pos = i + 4;
+        while (pos < segEnd) {
+            int tableClass = (buf[pos] >> 4) & 0x0F;
+            int tableId    =  buf[pos] & 0x0F;
+            pos++;
+
+            int nSymbols = 0;
+            for (int k = 0; k < 16 && pos + k < segEnd; k++)
+                nSymbols += buf[pos + k];
+            pos += 16;
+
+            // só tabelas AC — DC causaria dessincronização do stream
+            if (tableClass == 1 && nSymbols > 1 && pos + nSymbols <= segEnd) {
+                int      rotation = (tableId == 0) ? rotLuma : rotChroma;
+                uint8_t* syms     = buf + pos;
+                for (int sz = 1; sz <= 10; sz++) {
+                    uint8_t grpVal[16];
+                    int     grpIdx[16];
+                    int     gn = 0;
+                    for (int k = 0; k < nSymbols && gn < 16; k++) {
+                        if ((syms[k] & 0x0F) == sz) {
+                            grpVal[gn] = syms[k];
+                            grpIdx[gn] = k;
+                            gn++;
+                        }
+                    }
+                    if (gn < 2) continue;
+
+                    // rotação escalada por magnitude: freq alta gira mais
+                    int scaledRot = constrain((rotation * sz) / 5, 1, gn - 1);
+
+                    for (int k = 0; k < gn; k++)
+                        syms[grpIdx[k]] = grpVal[(k + scaledRot) % gn];
+                }
+            }
+            pos += nSymbols;
+        }
+        i = segEnd;
+    }
+}
+
+// ─── Captura ─────────────────────────────────────────────────────────────────
+
+void drawCaptureStatus(const char* label, int pct) {
+    tft.fillScreen(ST77XX_BLACK);
+    uint16_t bright = vfPalettes[vfColorIdx][3];
+    uint16_t mid    = vfPalettes[vfColorIdx][2];
+    uint16_t dim    = vfPalettes[vfColorIdx][1];
+    tft.setTextSize(1);
+    tft.setTextColor(dim);
+    tft.setCursor(52, 14);
+    tft.print("CYBER SHOT");
+    tft.setTextColor(bright);
+    tft.setCursor(8, 44);
+    tft.print(label);
+    tft.drawRect(8, 60, 144, 10, mid);
+    if (pct > 0)
+        tft.fillRect(9, 61, 142 * pct / 100, 8, bright);
+    tft.setTextColor(mid);
+    tft.setCursor(8, 76);
+    tft.printf("%d%%", pct);
+}
+
+// Tela de diagnóstico: título + últimas linhas do log. Espera BTN ou 20 s.
+static void showDiagScreen(const char* title) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(2, 2); tft.print(title);
+    tft.drawFastHLine(0, 11, 160, 0x7BEF);
+    const int maxLines = 12;
+    int first = logCount > maxLines ? logCount - maxLines : 0;
+    tft.setTextColor(0x7BEF);
+    char line[LOG_W];
+    for (int i = first, row = 0; logGet(i, line); i++, row++) {
+        line[26] = '\0';   // 26 colunas de 6 px — sem quebra de linha
+        tft.setCursor(2, 14 + row * 9);
+        tft.print(line);
+    }
+    tft.setTextColor(0x2965);
+    tft.setCursor(2, 120); tft.print("[BTN] close");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 20000) {
+        if (digitalRead(BTN_PIN) == LOW) { delay(180); break; }
+        delay(10);
+    }
+}
+
+// Volta ao viewfinder após foto/erro. Só escreve no sensor se a long exposure deixou o AE
+// automático ligado — fora isso, zero tráfego SCCB depois da foto.
+static bool camAeAuto = false;
+static void restoreViewfinder() {
+    if (camAeAuto) { camApplyVfExposure(); camAeAuto = false; }
+    vfNeedsClear = true;
+}
+
+// ─── Preview JPEG no TFT ─────────────────────────────────────────────────────
+
+static JPEGDEC  _jpeg;
+static int16_t  _pvX = 0, _pvY = 0;
+
+int previewCallback(JPEGDRAW* pDraw) {
+    tft.drawRGBBitmap(pDraw->x + _pvX, pDraw->y + _pvY,
+                      pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
+    return 1;
+}
+
+void showPreview(uint8_t* buf, size_t len, const char* filename) {
+    if (!_jpeg.openRAM(buf, (int)len, previewCallback)) return;
+
+    _jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+
+    int pw = _jpeg.getWidth()  / 8;
+    int ph = _jpeg.getHeight() / 8;
+    _pvX = (160 - pw) / 2;
+    _pvY = (128 - ph) / 2;
+
+    tft.fillScreen(ST77XX_BLACK);
+    _jpeg.decode(0, 0, JPEG_SCALE_EIGHTH);
+    _jpeg.close();
+
+    // overlay: nome do arquivo + instrução
+    tft.setTextSize(1);
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(2, 2);
+    tft.print(filename);
+
+    tft.setTextColor(0x2965);
+    tft.setCursor(2, 120);
+    tft.print("[BTN] close");
+
+    // aguarda botão ou timeout de 6 s
+    unsigned long t0 = millis();
+    while (millis() - t0 < 6000) {
+        if (digitalRead(BTN_PIN) == LOW) { delay(180); break; }
+        delay(10);
+    }
+    vfNeedsClear = true;
+}
+
+// ─── Viewfinder JPEG → RGB565 ────────────────────────────────────────────────
+// decBuf recebe frames XGA (JPEG) decodificados a 1/8 (128×96, big-endian como o sensor
+// em RGB565) — medição de luma da foto com measureLuma.
+
+static const int DEC_W = 128, DEC_H = 96;     // 1024/8 × 768/8
+static uint8_t*  decBuf = nullptr;
+static int       vfFailCount = 0;
+static int       vfLastLuma  = 0;
+
+static int decCb(JPEGDRAW* d) {
+    for (int r = 0; r < d->iHeight; r++) {
+        int y = d->y + r;
+        if (y >= DEC_H) break;
+        int w = min(d->iWidth, DEC_W - d->x);
+        if (w <= 0) continue;
+        memcpy(decBuf + ((long)y * DEC_W + d->x) * 2,
+               (uint8_t*)d->pPixels + (long)r * d->iWidth * 2, w * 2);
+    }
+    return 1;
+}
+
+// Decodifica um JPEG XGA a 1/8 em decBuf. false = tamanho inesperado ou corrompido.
+static bool decodeEighth(uint8_t* jpg, size_t len) {
+    if (!decBuf || len < 1000 || !_jpeg.openRAM(jpg, (int)len, decCb)) return false;
+    // cabeçalho pode vir arredondado a múltiplos de MCU; o callback recorta em 128×96
+    int w = _jpeg.getWidth(), h = _jpeg.getHeight();
+    bool ok = false;
+    if (w >= 512 && w <= 1040 && h >= 384 && h <= 784) {
+        _jpeg.setPixelType(RGB565_BIG_ENDIAN);
+        ok = _jpeg.decode(0, 0, JPEG_SCALE_EIGHTH) != 0;
+    } else {
+        static int badDim = 0;
+        if (++badDim <= 3) dlog("[VF] jpeg %dx%d inesperado", w, h);
+    }
+    _jpeg.close();
+    return ok;
+}
+
+static int photoLuma(uint8_t* jpg, size_t len) {
+    return decodeEighth(jpg, len) ? measureLuma(decBuf, DEC_W, DEC_H) : -1;
+}
+
+// VF: 128×96 (decBuf) → 160×120 (vfBuf), vizinho mais próximo 4:5. Copia em uint16 —
+// mantém os bytes big-endian que toGreenTones/writePixels esperam.
+static const int VF_W = 160, VF_H = 120;
+static uint8_t*  vfBuf = nullptr;
+static void upscaleToVf() {
+    const uint16_t* src = (const uint16_t*)decBuf;
+    uint16_t*       dst = (uint16_t*)vfBuf;
+    for (int y = 0; y < VF_H; y++) {
+        const uint16_t* srow = src + (y * DEC_H / VF_H) * DEC_W;
+        uint16_t*       drow = dst + y * VF_W;
+        for (int x = 0; x < VF_W; x++) drow[x] = srow[x * DEC_W / VF_W];
+    }
+}
+
+// Próximo frame XGA completo (≥ 20 KB; frames QQVGA antigos na fila são menores). NULL = nada.
+static camera_fb_t* camNextXgaFrame() {
+    for (int i = 0; i < 6; i++) {
+        unsigned long tw = millis();
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) { dlog("[CAP] frame NULL %lums", millis() - tw); return nullptr; }
+        if (fb->len >= 20000) return fb;
+        esp_camera_fb_return(fb);
+    }
+    return nullptr;
+}
+
+// Foto: o sensor já está em XGA com a exposição do VF — descarta 2 frames (fila GRAB_LATEST
+// de 2 + frame em andamento podem ser de antes do flash) e devolve o próximo completo.
+static camera_fb_t* grabCaptureFrame(const char* label, int pct) {
+    drawCaptureStatus(label, pct);
+    camDropFrames(2);
+    return camNextXgaFrame();
+}
+
+// ─── Long exposure: stacking de frames ──────────────────────────────────────
+// Captura JPEG QVGA e usa JPEGDEC para decodificar cada frame.
+// JPEGDEC já funciona corretamente no preview TFT (RGB565_LITTLE_ENDIAN
+// confirmado), então os canais R/G/B têm ordem garantida sem ambiguidade.
+
+static uint16_t* g_leR = nullptr;
+static uint16_t* g_leG = nullptr;
+static uint16_t* g_leB = nullptr;
+static int        g_leW = 1024;
+
+int leStackCallback(JPEGDRAW* pDraw) {
+    for (int y = 0; y < pDraw->iHeight; y++) {
+        for (int x = 0; x < pDraw->iWidth; x++) {
+            int idx = (pDraw->y + y) * g_leW + (pDraw->x + x);
+            uint16_t p = pDraw->pPixels[y * pDraw->iWidth + x];
+            // Acumula bits raw — mais rápido e usa metade da RAM vs float
+            g_leR[idx] += (p >> 11) & 0x1F;   // 0-31 por frame
+            g_leG[idx] += (p >>  5) & 0x3F;   // 0-63 por frame
+            g_leB[idx] +=  p        & 0x1F;   // 0-31 por frame
+        }
+    }
+    return 1;
+}
+
+void takeLongExposureStacked() {
+    const int W = 1024, H = 768, N = W * H;
+
+    tft.fillScreen(gbPalette[3]); delay(15);
+    tft.fillScreen(gbPalette[0]);
+    drawCaptureStatus("SETTLING...", 3);
+
+    // sensor já em XGA; acumuladores uint16_t = 4.5MB (cabe nos 8MB PSRAM)
+
+    // Começa com exposição máxima, habilita AE auto — converge de cima pra baixo (rápido)
+    {
+        sensor_t* s = esp_camera_sensor_get();
+        if (s) {
+            s->set_aec_value(s, 1200);
+            s->set_agc_gain(s, 30);
+            s->set_exposure_ctrl(s, 1);
+            s->set_gain_ctrl(s, 1);
+            camAeAuto = true;   // restoreViewfinder volta para manual
+        }
+    }
+
+    // 10 frames: troca de resolução + AE desce do máximo até o valor correto
+    for (int i = 0; i < 10; i++) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) break;
+        esp_camera_fb_return(fb);
+        delay(1);
+    }
+    // AE permanece em auto durante toda a captura
+
+    uint16_t* accR = (uint16_t*)ps_malloc(N * sizeof(uint16_t));
+    uint16_t* accG = (uint16_t*)ps_malloc(N * sizeof(uint16_t));
+    uint16_t* accB = (uint16_t*)ps_malloc(N * sizeof(uint16_t));
+
+    if (!accR || !accG || !accB) {
+        free(accR); free(accG); free(accB);
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextColor(ST77XX_RED); tft.setTextSize(1);
+        tft.setCursor(8, 55); tft.print("PSRAM error");
+        delay(2000);
+        restoreViewfinder(); return;
+    }
+    for (int i = 0; i < N; i++) { accR[i] = 0; accG[i] = 0; accB[i] = 0; }
+
+    g_leR = accR; g_leG = accG; g_leB = accB; g_leW = W;
+
+    // usa _jpeg (static) — instância local causaria stack overflow
+    int frameCount = 0;
+    unsigned long t0      = millis();
+    unsigned long totalMs = (unsigned long)leSeconds * 1000UL;
+    int lastPct = 5;
+
+    digitalWrite(LED_FLASH, HIGH);
+    while (millis() - t0 < totalMs) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) { delay(5); continue; }
+
+        if (fb->format == PIXFORMAT_JPEG && fb->len >= 20000) {   // < 20 KB = QQVGA antigo na fila
+            if (_jpeg.openRAM(fb->buf, (int)fb->len, leStackCallback)) {
+                if (_jpeg.getWidth() == W && _jpeg.getHeight() == H) {
+                    _jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+                    _jpeg.decode(0, 0, 0);   // sem escala — resolução completa
+                    frameCount++;
+                }
+                _jpeg.close();
+            }
+        }
+        esp_camera_fb_return(fb);
+        delay(1);   // yield RTOS / watchdog
+
+        int pct = 5 + (int)((millis() - t0) * 85UL / totalMs);
+        if (pct > lastPct) {
+            int sLeft = leSeconds - (int)((millis() - t0) / 1000);
+            char lbl[22]; snprintf(lbl, sizeof(lbl), "EXPOSING... %ds", sLeft);
+            drawCaptureStatus(lbl, pct);
+            lastPct = pct;
+        }
+    }
+
+    digitalWrite(LED_FLASH, LOW);
+    g_leR = g_leG = g_leB = nullptr;
+    drawCaptureStatus("PROCESSING...", 92);
+
+    dlog("[LE] %d frames em %ds", frameCount, leSeconds);
+    if (frameCount == 0) {
+        free(accR); free(accG); free(accB);
+        showDiagScreen("LONG EXP ERROR");
+        restoreViewfinder();
+        return;
+    }
+
+    // Mede luma média (bits raw: R/B em 0-31, G em 0-63) → escala para 0.0-1.0
+    float sumLuma = 0.0f;
+    {
+        const float kR = 0.299f / (31.0f * frameCount);
+        const float kG = 0.587f / (63.0f * frameCount);
+        const float kB = 0.114f / (31.0f * frameCount);
+        for (int i = 0; i < N; i++)
+            sumLuma += accR[i] * kR + accG[i] * kG + accB[i] * kB;
+    }
+    float avgLuma = sumLuma / (float)N;
+    float boost   = (avgLuma > 0.005f) ? fminf(6.0f, 0.35f / avgLuma) : 1.0f;
+
+    uint8_t* rgb = (uint8_t*)ps_malloc(N * 3);
+    if (rgb) {
+        const float invR = 255.0f * boost / (31.0f * frameCount);
+        const float invG = 255.0f * boost / (63.0f * frameCount);
+        for (int i = 0; i < N; i++) {
+            float r = accR[i] * invR;
+            float g = accG[i] * invG;
+            float b = accB[i] * invR;
+            // fmt2jpg espera BGR888 — inverte R e B
+            rgb[i * 3    ] = b > 255.0f ? 255 : (uint8_t)b;
+            rgb[i * 3 + 1] = g > 255.0f ? 255 : (uint8_t)g;
+            rgb[i * 3 + 2] = r > 255.0f ? 255 : (uint8_t)r;
+        }
+    }
+    free(accR); free(accG); free(accB);
+
+    if (!rgb) {
+        restoreViewfinder(); return;
+    }
+
+    uint8_t* jpg    = nullptr;
+    size_t   jpgLen = 0;
+    fmt2jpg(rgb, N * 3, W, H, PIXFORMAT_RGB888, 90, &jpg, &jpgLen);
+    free(rgb);
+
+    if (!jpg || jpgLen == 0) {
+        free(jpg);
+        restoreViewfinder(); return;
+    }
+
+    if (photoBuf) { free(photoBuf); photoBuf = nullptr; }
+    photoBuf = (uint8_t*)ps_malloc(jpgLen);
+    if (photoBuf) {
+        memcpy(photoBuf, jpg, jpgLen);
+        photoLen   = jpgLen;
+        photoReady = true;
+    }
+    free(jpg);
+
+    // Efeitos de glitch (JPEG databending)
+    if (photoBuf && (fxDQT || fxScan || fxChroma || fxZigzag || fxDHT)) {
+        drawCaptureStatus("GLITCHING...", 96);
+        if (fxZigzag) applyGlitchZigzag(photoBuf, photoLen);
+        if (fxDQT)    applyGlitchDQT(photoBuf, photoLen);
+        if (fxDHT)    applyGlitchDHT(photoBuf, photoLen);
+        if (fxScan)   applyGlitchScan(photoBuf, photoLen);
+        if (fxChroma) applyGlitchChroma(photoBuf, photoLen);
+    }
+
+    // WiFi
+    if (!wifiAP && !wifiOK && WiFi.status() == WL_CONNECTED) {
+        wifiOK = true; setupWebServer();
+    }
+
+    char filename[32] = "";
+    bool savedSD = saveToSD(photoBuf, photoLen, filename);
+
+    restoreViewfinder();
+    drawCaptureStatus("DONE!", 100);
+
+    if (photoBuf) {
+        char label[36];
+        if (savedSD) snprintf(label, sizeof(label), "%s", filename + 1);
+        else         snprintf(label, sizeof(label), "RAM (no SD)");
+        showPreview(photoBuf, photoLen, label);
+    } else {
+        vfNeedsClear = true;
+    }
+}
+
+void takePhoto() {
+    if (leSeconds > 0) { takeLongExposureStacked(); return; }
+
+    // flash de obturador
+    tft.fillScreen(gbPalette[3]); delay(25);
+    tft.fillScreen(gbPalette[1]); delay(20);
+    tft.fillScreen(gbPalette[0]);
+
+    const char* captureLabel = "CAPTURING...";
+    drawCaptureStatus(captureLabel, 5);
+
+    // captura: sensor já em XGA — só espera o próximo frame completo com o flash ligado
+    dlog("[CAP] aec %d g %d", vfAecValue, vfAgcGain);
+    digitalWrite(LED_FLASH, HIGH);
+    camera_fb_t* fb = grabCaptureFrame(captureLabel, 25);
+    digitalWrite(LED_FLASH, LOW);
+    if (!fb) {
+        showDiagScreen("CAPTURE ERROR");
+        restoreViewfinder();
+        return;
+    }
+    drawCaptureStatus(captureLabel, 50);
+
+    if (photoBuf) { free(photoBuf); photoBuf = nullptr; }
+    photoBuf = (uint8_t*)ps_malloc(fb->len);
+    if (photoBuf) {
+        memcpy(photoBuf, fb->buf, fb->len);
+        photoLen   = fb->len;
+        photoReady = true;
+    }
+    esp_camera_fb_return(fb); fb = nullptr;
+    if (photoBuf) dlog("[CAP] luma %d (alvo %d)", photoLuma(photoBuf, photoLen), LUMA_TARGET);
+
+    // JPEG FX: databending em photoBuf
+    if (photoBuf && (fxDQT || fxScan || fxChroma || fxZigzag || fxDHT)) {
+        drawCaptureStatus("GLITCHING...", 90);
+        if (fxZigzag) applyGlitchZigzag(photoBuf, photoLen);
+        if (fxDQT)    applyGlitchDQT(photoBuf, photoLen);
+        if (fxDHT)    applyGlitchDHT(photoBuf, photoLen);
+        if (fxScan)   applyGlitchScan(photoBuf, photoLen);
+        if (fxChroma) applyGlitchChroma(photoBuf, photoLen);
+    }
+
+    // reconecta STA se necessário (não aplica em modo AP)
+    if (!wifiAP) {
+        if (!wifiOK && WiFi.status() == WL_CONNECTED) { wifiOK = true; setupWebServer(); }
+        if (!wifiOK) {
+            unsigned long t = millis();
+            while (millis() - t < 4000 && WiFi.status() != WL_CONNECTED) delay(100);
+            if (WiFi.status() == WL_CONNECTED) { wifiOK = true; setupWebServer(); }
+        }
+    }
+
+    char filename[32] = "";
+    bool savedSD = saveToSD(photoBuf, photoLen, filename);
+
+    dlog("[CAP] saved %s", savedSD ? filename + 1 : "RAM");
+    restoreViewfinder();
+    drawCaptureStatus("DONE!", 100);
+
+    // exibe preview no TFT
+    if (photoBuf) {
+        char label[36];
+        if (savedSD) snprintf(label, sizeof(label), "%s", filename + 1);
+        else         snprintf(label, sizeof(label), "RAM (no SD)");
+        showPreview(photoBuf, photoLen, label);
+    } else {
+        vfNeedsClear = true;
+    }
+}
+
+// ─── Handlers web ─────────────────────────────────────────────────────────────
+
+void handleEditor() {
+    if (esp_get_free_heap_size() < 18000) {
+        server.send(503, "text/plain", "low memory - try again");
+        return;
+    }
+    String file = server.arg("file");
+    String ram  = server.arg("ram");
+    String src  = ram.length() ? "/foto" : ("/sd/" + file);
+    String dlname = file.length() ? (file.substring(0, file.lastIndexOf('.')) + "_edit.jpg") : "cybershot_edit.jpg";
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    // cabeçalho + CSS
+    server.sendContent(
+        "<!DOCTYPE html><html><head>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta charset='utf-8'><title>editor</title>"
+        "<style>"
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{background:#0a0a0a;color:#ccc;font-family:monospace;margin:0;overflow:hidden}"
+        ".topbar{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:#0d0d0d;border-bottom:1px solid #1a1a1a}"
+        ".topbar a{color:#0f0;font-size:12px;text-decoration:none}"
+        ".topbar h2{color:#0f0;font-size:14px}"
+        ".fn{font-size:10px;color:#555;padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:#0d0d0d;border-bottom:1px solid #111}"
+        ".editor-layout{display:flex;flex-direction:column;height:calc(100vh - 58px)}"
+        ".canvas-panel{display:flex;flex-direction:column;align-items:center;justify-content:center;background:#111;flex-shrink:0;max-height:42vh;overflow:hidden}"
+        ".wrap{width:100%}"
+        "canvas{max-width:100%;max-height:38vh;display:block;margin:0 auto}"
+        "#status{font-size:10px;color:#444;padding:2px 8px;text-align:center}"
+        ".ctrl-panel{flex:1;overflow-y:auto;padding:8px}"
+        "@media(min-width:600px){"
+          ".editor-layout{flex-direction:row;height:calc(100vh - 58px)}"
+          ".canvas-panel{flex:1;max-height:none;height:100%;align-self:stretch}"
+          "canvas{max-height:calc(100vh - 90px);max-width:100%}"
+          ".ctrl-panel{width:300px;min-width:280px;height:100%;border-left:1px solid #1a1a1a;padding:8px}}"
+        ".sec{font-size:9px;color:#888;text-transform:uppercase;letter-spacing:2px;margin:8px 0 4px;border-bottom:1px solid #1a1a1a;padding-bottom:2px}"
+        ".row{display:flex;align-items:center;gap:6px;margin:4px 0}"
+        "label{width:72px;font-size:10px;color:#777;flex-shrink:0}"
+        "input[type=range]{flex:1;accent-color:#0f0;height:20px}"
+        ".val{width:28px;text-align:right;font-size:10px;color:#aaa}"
+        ".btns{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0}"
+        "button{background:#141414;border:1px solid #2a2a2a;color:#0f0;"
+        "padding:8px 12px;font-family:monospace;font-size:11px;"
+        "cursor:pointer;border-radius:3px;touch-action:manipulation;flex:1;min-width:60px}"
+        "button:active{opacity:.7}"
+        "button.on{background:#0f0;color:#000;border-color:#0f0}"
+        ".rot button{color:#08f;border-color:#08f}"
+        ".rot button.on{background:#08f;color:#000}"
+        ".pxs button{color:#f0f;border-color:#f0f}"
+        ".pxs button.on{background:#f0f;color:#000}"
+        ".ebt button{color:#0ff;border-color:#0ff}"
+        ".ebt button.on{background:#0ff;color:#000}"
+        ".asc button{color:#f55;border-color:#f55}"
+        ".asc button.on{background:#f55;color:#000}"
+        ".crp button{color:#fa0;border-color:#fa0;min-width:44px}"
+        ".crp button.on{background:#fa0;color:#000}"
+        "#bSave{border-color:#ff0;color:#ff0;flex:2}"
+        "#bSave.on{background:#ff0;color:#000}"
+        ".divider{height:1px;background:#161616;margin:8px 0}"
+        "</style></head><body>"
+    );
+
+    // barra superior
+    server.sendContent(
+        "<div class='topbar'>"
+        "<a href='/galeria'>&#8592; gallery</a>"
+        "<h2>EDITOR</h2><span></span>"
+        "</div>"
+    );
+    {
+        char fnBuf[72];
+        snprintf(fnBuf, sizeof(fnBuf), "<div class='fn'>%s</div>",
+                 file.length() ? file.c_str() : "last photo (RAM)");
+        server.sendContent(fnBuf, strlen(fnBuf));
+    }
+
+    // canvas + controles
+    server.sendContent(
+        "<div class='editor-layout'>"
+        "<div class='canvas-panel'>"
+        "<div class='wrap'><canvas id='c'></canvas></div>"
+        "<div id='status'>loading...</div>"
+        "</div>"
+        "<div class='ctrl-panel'>"
+
+        "<div class='sec'>adjust</div>"
+        "<div class='row'><label>brightness</label><input type='range' id='sBri' min='-100' max='100' value='0'><span class='val' id='vBri'>0</span></div>"
+        "<div class='row'><label>contrast</label><input type='range' id='sCon' min='-100' max='100' value='0'><span class='val' id='vCon'>0</span></div>"
+        "<div class='row'><label>saturation</label><input type='range' id='sSat' min='-100' max='100' value='0'><span class='val' id='vSat'>0</span></div>"
+        "<div class='row'><label>shadows</label><input type='range' id='sSha' min='-100' max='100' value='0'><span class='val' id='vSha'>0</span></div>"
+        "<div class='row'><label>highlights</label><input type='range' id='sHil' min='-100' max='100' value='0'><span class='val' id='vHil'>0</span></div>"
+        "<div class='row'><label>temp</label><input type='range' id='sTemp' min='-50' max='50' value='0'><span class='val' id='vTemp'>0</span></div>"
+        "<div class='row'><label>fade</label><input type='range' id='sFade' min='0' max='100' value='0'><span class='val' id='vFade'>0</span></div>"
+        "<div class='row'><label>vignette</label><input type='range' id='sVig' min='0' max='100' value='0'><span class='val' id='vVig'>0</span></div>"
+        "<div class='row'><label>chroma ab.</label><input type='range' id='sCA' min='0' max='20' value='0'><span class='val' id='vCA'>0</span></div>"
+
+        "<div class='sec'>crop</div>"
+        "<div class='btns crp'>"
+        "<button id='bCrOrig' class='on'>orig</button>"
+        "<button id='bCr11'>1:1</button>"
+        "<button id='bCr45'>4:5</button>"
+        "<button id='bCr169'>16:9</button>"
+        "<button id='bCr916'>9:16</button>"
+        "<button id='bCr32'>3:2</button>"
+        "</div>"
+        "<div class='row'><label>scale</label><input type='range' id='sCrSc' min='25' max='100' value='100'><span class='val' id='vCrSc'>100</span></div>"
+        "<div class='row'><label>pan X</label><input type='range' id='sCrX' min='0' max='100' value='50'><span class='val' id='vCrX'>50</span></div>"
+        "<div class='row'><label>pan Y</label><input type='range' id='sCrY' min='0' max='100' value='50'><span class='val' id='vCrY'>50</span></div>"
+        "<div class='btns crp'><button id='bCrApply'>&#9986; apply crop</button></div>"
+
+        "<div class='sec'>filter</div>"
+        "<div class='btns'>"
+        "<button id='bGray'>grayscale</button>"
+        "<button id='bSepia'>sepia</button>"
+        "<button id='bInvert'>invert</button>"
+        "<button id='bNoir'>noir</button>"
+        "</div>"
+
+        "<div class='sec'>rotation</div>"
+        "<div class='btns rot'>"
+        "<button id='bRotL'>&#8634; 90°</button>"
+        "<button id='bRotR'>&#8635; 90°</button>"
+        "<button id='bFlip'>&#8596; flip</button>"
+        "</div>"
+
+        "<div class='sec'>pixel sort</div>"
+        "<div class='row'><label>thr min</label>"
+        "<input type='range' id='sPsMin' min='0' max='100' value='20'>"
+        "<span class='val' id='vPsMin'>20</span></div>"
+        "<div class='row'><label>thr max</label>"
+        "<input type='range' id='sPsMax' min='0' max='100' value='80'>"
+        "<span class='val' id='vPsMax'>80</span></div>"
+        "<div class='btns'>"
+        "<button id='bPsH' class='on'>&#8596; H</button>"
+        "<button id='bPsV'>&#8597; V</button>"
+        "<button id='bPsLuma' class='on'>luma</button>"
+        "<button id='bPsHue'>hue</button>"
+        "<button id='bPsSat'>sat</button>"
+        "</div>"
+        "<div class='btns pxs'><button id='bPxSort'>&#8801; sort: off</button></div>"
+
+        "<div class='sec'>8 bit</div>"
+        "<div class='row'><label>pixels</label>"
+        "<input type='range' id='sEBsz' min='4' max='24' value='8' step='2'>"
+        "<span class='val' id='vEBsz'>8</span></div>"
+        "<div class='row'><label>colors</label>"
+        "<input type='range' id='sELvl' min='2' max='8' value='4' step='1'>"
+        "<span class='val' id='vELvl'>4</span></div>"
+        "<div class='btns ebt'><button id='bEight'>&#9632; 8bit: off</button></div>"
+
+        "<div class='sec'>ascii art</div>"
+        "<div class='btns asc'>"
+        "<button id='bAcCs0' class='on'>.@#</button>"
+        "<button id='bAcCs1'>&#9617;&#9618;&#9619;</button>"
+        "<button id='bAcCs2'>01</button>"
+        "<button id='bAcCs3'>&#9616;&#9600;&#9622;</button>"
+        "</div>"
+        "<div class='row'><label>tamanho</label>"
+        "<input type='range' id='sAcSz' min='4' max='20' value='8' step='2'>"
+        "<span class='val' id='vAcSz'>8</span></div>"
+        "<div class='btns asc'>"
+        "<button id='bAcCmono' class='on'>mono</button>"
+        "<button id='bAcCcolor'>color</button>"
+        "<button id='bAcCgreen'>green</button>"
+        "<button id='bAcCamber'>amber</button>"
+        "</div>"
+        "<div class='btns asc'><button id='bAscii'>Aa ascii: off</button></div>"
+
+        "<div class='divider'></div>"
+        "<div class='btns'>"
+        "<button id='bReset'>reset</button>"
+        "<button id='bSave'>&#8595; save</button>"
+        "</div></div></div>"
+    );
+
+    // JS: carregamento da imagem
+    {static const char _s[] =
+        "<script>"
+        "const c=document.getElementById('c'),ctx=c.getContext('2d');"
+        "let orig=null,origW=0,origH=0,rot=0,flipH=false,filt=null,eightOn=false,cropRatio=null,asciiOn=false,asciiCs=0,asciiCol='mono';"
+        "const img=new Image();"
+        "img.crossOrigin='anonymous';"
+        "img.onload=()=>{"
+          "origW=img.width;origH=img.height;"
+          "const t=document.createElement('canvas');"
+          "t.width=origW;t.height=origH;"
+          "t.getContext('2d').drawImage(img,0,0);"
+          "orig=t.getContext('2d').getImageData(0,0,origW,origH);"
+          "document.getElementById('status').textContent=origW+'x'+origH+' — pronto';"
+          "render();"
+        "};"
+        "img.onerror=()=>document.getElementById('status').textContent='erro ao carregar';"
+        "img.src='";
+    server.sendContent(_s, sizeof(_s)-1);}
+    server.sendContent(src);
+    server.sendContent("';", 2);
+
+    // JS: render()
+    server.sendContent(
+        "function clamp(v){return Math.max(0,Math.min(255,v))}"
+        "function render(){"
+          "if(!orig)return;"
+          // ajustes de pixel (bri/con/sat/filtro)
+          "const d=new ImageData(new Uint8ClampedArray(orig.data),origW,origH);"
+          "const px=d.data;"
+          "const br=+document.getElementById('sBri').value;"
+          "const co=+document.getElementById('sCon').value;"
+          "const sa=+document.getElementById('sSat').value;"
+          "const te=+document.getElementById('sTemp').value;"
+          "const sh=+document.getElementById('sSha').value;"
+          "const hi=+document.getElementById('sHil').value;"
+          "const fd=+document.getElementById('sFade').value/100;"
+          "const cf=259*(co+255)/(255*(259-co)),sm=1+sa/100;"
+          "for(let i=0;i<px.length;i+=4){"
+            "let r=px[i],g=px[i+1],b=px[i+2];"
+            "r+=br;g+=br;b+=br;"
+            "r=cf*(r-128)+128;g=cf*(g-128)+128;b=cf*(b-128)+128;"
+            "const gr=0.299*r+0.587*g+0.114*b;"
+            "r=gr+(r-gr)*sm;g=gr+(g-gr)*sm;b=gr+(b-gr)*sm;"
+            "if(te!==0){r+=te*0.8;b-=te*0.8;}"
+            "if(sh!==0){const sl=Math.max(0,1-(0.299*r+0.587*g+0.114*b)/128);const a=sh*0.6*sl;r+=a;g+=a;b+=a;}"
+            "if(hi!==0){const hl=Math.max(0,(0.299*r+0.587*g+0.114*b-128)/128);const a=hi*0.6*hl;r+=a;g+=a;b+=a;}"
+            "if(fd>0){r=r*(1-fd*0.35)+fd*55;g=g*(1-fd*0.35)+fd*52;b=b*(1-fd*0.35)+fd*48;}"
+            "if(filt==='gray'){const fl=0.299*r+0.587*g+0.114*b;r=g=b=fl;}"
+            "else if(filt==='sepia'){"
+              "const sr=r*0.393+g*0.769+b*0.189,sg=r*0.349+g*0.686+b*0.168,sb=r*0.272+g*0.534+b*0.131;"
+              "r=sr;g=sg;b=sb;"
+            "}else if(filt==='invert'){r=255-r;g=255-g;b=255-b;}"
+            "else if(filt==='noir'){const nl=0.299*r+0.587*g+0.114*b;r=g=b=(nl-128)*1.5+128;}"
+            "px[i]=clamp(r);px[i+1]=clamp(g);px[i+2]=clamp(b);"
+          "}"
+          // rotação + flip
+          "const ptmp=document.createElement('canvas');"
+          "ptmp.width=origW;ptmp.height=origH;"
+          "ptmp.getContext('2d').putImageData(d,0,0);"
+          "const sw=rot%2!==0;"
+          "c.width=sw?origH:origW;c.height=sw?origW:origH;"
+          "ctx.save();ctx.translate(c.width/2,c.height/2);ctx.rotate(rot*Math.PI/2);"
+          "if(flipH)ctx.scale(-1,1);"
+          "ctx.drawImage(ptmp,-origW/2,-origH/2);ctx.restore();"
+          // vignete
+          "const vig=+document.getElementById('sVig').value;"
+          "if(vig>0){"
+            "const vg=ctx.createRadialGradient(c.width/2,c.height/2,Math.min(c.width,c.height)*0.25,c.width/2,c.height/2,Math.max(c.width,c.height)*0.75);"
+            "vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(0,0,0,'+vig/100+')');"
+            "ctx.fillStyle=vg;ctx.fillRect(0,0,c.width,c.height);"
+          "}"
+          // aberração cromática
+          "const ca=+document.getElementById('sCA').value;"
+          "if(ca>0){"
+            "const caid=ctx.getImageData(0,0,c.width,c.height);"
+            "const casrc=new Uint8ClampedArray(caid.data);"
+            "const CW=c.width,CH=c.height;"
+            "for(let y=0;y<CH;y++){for(let x=0;x<CW;x++){"
+              "const i=(y*CW+x)*4;"
+              "const rx=Math.min(CW-1,x+ca),bx=Math.max(0,x-ca);"
+              "caid.data[i]=casrc[(y*CW+rx)*4];"
+              "caid.data[i+2]=casrc[(y*CW+bx)*4+2];"
+            "}}"
+            "ctx.putImageData(caid,0,0);"
+          "}"
+          // ordenação de pixels
+          "if(psOn){"
+            "const psid=ctx.getImageData(0,0,c.width,c.height);"
+            "const pspx=psid.data;"
+            "const PW=c.width,PH=c.height;"
+            "const pt0=+document.getElementById('sPsMin').value/100;"
+            "const pt1=+document.getElementById('sPsMax').value/100;"
+            "function psK(i){"
+              "const r=pspx[i]/255,g=pspx[i+1]/255,b=pspx[i+2]/255;"
+              "if(psKey==='luma')return 0.299*r+0.587*g+0.114*b;"
+              "const mx=Math.max(r,g,b),mn=Math.min(r,g,b),d=mx-mn;"
+              "if(psKey==='sat')return mx===0?0:d/mx;"
+              "if(d===0)return 0;"
+              "let h=mx===r?(g-b)/d:mx===g?(b-r)/d+2:(r-g)/d+4;"
+              "return((h%6)+6)%6/6;}"
+            "const pLines=psDir==='v'?PW:PH,pLen=psDir==='v'?PH:PW;"
+            "for(let li=0;li<pLines;li++){"
+              "const gi=psDir==='v'?(p)=>(p*PW+li)*4:(p)=>(li*PW+p)*4;"
+              "let ss=-1;"
+              "const fl=(end)=>{"
+                "if(end-ss<2){ss=-1;return;}"
+                "const seg=[];"
+                "for(let p=ss;p<end;p++){const i=gi(p);seg.push({k:psK(i),r:pspx[i],g:pspx[i+1],b:pspx[i+2]});}"
+                "seg.sort((a,b)=>a.k-b.k);"
+                "for(let p=ss;p<end;p++){const i=gi(p),s=seg[p-ss];pspx[i]=s.r;pspx[i+1]=s.g;pspx[i+2]=s.b;}"
+                "ss=-1;};"
+              "for(let pos=0;pos<=pLen;pos++){"
+                "if(pos<pLen){const i=gi(pos),k=psK(i);"
+                  "if(k>=pt0&&k<=pt1){if(ss===-1)ss=pos;}else if(ss!==-1)fl(pos);}"
+                "else if(ss!==-1)fl(pos);}}"
+            "ctx.putImageData(psid,0,0);"
+          "}"
+          // 8-bit: pixelação + quantização de cor
+          "if(eightOn){"
+            "const EW=c.width,EH=c.height;"
+            "const bsz=+document.getElementById('sEBsz').value;"
+            "const lvl=+document.getElementById('sELvl').value;"
+            "const eid=ctx.getImageData(0,0,EW,EH);"
+            "const epx=eid.data;"
+            "const step=255/(lvl-1);"
+            "for(let by=0;by<EH;by+=bsz){for(let bx=0;bx<EW;bx+=bsz){"
+              "let sr=0,sg=0,sb=0,cnt=0;"
+              "const bx2=Math.min(bx+bsz,EW),by2=Math.min(by+bsz,EH);"
+              "for(let y=by;y<by2;y++){for(let x=bx;x<bx2;x++){"
+                "const i=(y*EW+x)*4;sr+=epx[i];sg+=epx[i+1];sb+=epx[i+2];cnt++;}}"
+              "const qr=Math.round(Math.round(sr/cnt/step)*step);"
+              "const qg=Math.round(Math.round(sg/cnt/step)*step);"
+              "const qb=Math.round(Math.round(sb/cnt/step)*step);"
+              "for(let y=by;y<by2;y++){for(let x=bx;x<bx2;x++){"
+                "const i=(y*EW+x)*4;epx[i]=qr;epx[i+1]=qg;epx[i+2]=qb;}}}}"
+            "ctx.putImageData(eid,0,0);"
+          "}"
+          // converte canvas em ascii art
+          "if(asciiOn){"
+            "const AW=c.width,AH=c.height;"
+            "const src=ctx.getImageData(0,0,AW,AH),spx=src.data;"
+            "const out=document.createElement('canvas');"
+            "out.width=AW;out.height=AH;"
+            "const octx=out.getContext('2d');"
+            "octx.fillStyle='#000';octx.fillRect(0,0,AW,AH);"
+            "const csz=+document.getElementById('sAcSz').value;"
+            "octx.font='bold '+csz+'px monospace';octx.textBaseline='top';"
+            "const charsets=[' .:-=+*#@%',' \\u2591\\u2592\\u2593\\u2588',' 01',' \\u2596\\u258c\\u259b\\u2588'];"
+            "const charset=charsets[asciiCs],clen=charset.length;"
+            "for(let y=0;y<AH;y+=csz){for(let x=0;x<AW;x+=csz){"
+              "let r=0,g=0,b=0,cnt=0;"
+              "const x2=Math.min(x+csz,AW),y2=Math.min(y+csz,AH);"
+              "for(let py=y;py<y2;py++){for(let px=x;px<x2;px++){"
+                "const i=(py*AW+px)*4;r+=spx[i];g+=spx[i+1];b+=spx[i+2];cnt++;}}"
+              "r/=cnt;g/=cnt;b/=cnt;"
+              "const luma=0.299*r+0.587*g+0.114*b;"
+              "const ch=charset[Math.min(clen-1,Math.floor(luma/255*clen))];"
+              "if(asciiCol==='color'){octx.fillStyle='rgb('+Math.round(r)+','+Math.round(g)+','+Math.round(b)+')';}"
+              "else if(asciiCol==='green'){const v=Math.round(luma*0.7+55);octx.fillStyle='rgb(0,'+v+',0)';}"
+              "else if(asciiCol==='amber'){const v=Math.round(luma*0.7+55);octx.fillStyle='rgb('+v+','+Math.round(v*0.45)+',0)';}"
+              "else{const v=Math.round(luma);octx.fillStyle='rgb('+v+','+v+','+v+')';}"
+              "if(ch.trim())octx.fillText(ch,x,y);}}"
+            "ctx.drawImage(out,0,0);"
+          "}"
+          // overlay de crop com grade de terços
+          "if(cropRatio){"
+            "const CW=c.width,CH=c.height,rw=cropRatio.w,rh=cropRatio.h;"
+            "let cw,ch;"
+            "if(rw/rh>CW/CH){cw=CW;ch=Math.round(CW*rh/rw);}else{ch=CH;cw=Math.round(CH*rw/rh);}"
+            "const sc=+document.getElementById('sCrSc').value/100;"
+            "cw=Math.max(4,Math.round(cw*sc));ch=Math.max(4,Math.round(ch*sc));"
+            "const px2=+document.getElementById('sCrX').value/100;"
+            "const py2=+document.getElementById('sCrY').value/100;"
+            "const cx=Math.round(px2*(CW-cw)),cy=Math.round(py2*(CH-ch));"
+            "const saved=ctx.getImageData(cx,cy,Math.max(1,cw),Math.max(1,ch));"
+            "ctx.fillStyle='rgba(0,0,0,0.65)';ctx.fillRect(0,0,CW,CH);"
+            "ctx.putImageData(saved,cx,cy);"
+            "ctx.strokeStyle='rgba(255,255,255,0.9)';ctx.lineWidth=1;"
+            "ctx.strokeRect(cx+0.5,cy+0.5,cw-1,ch-1);"
+            "ctx.strokeStyle='rgba(255,255,255,0.25)';ctx.lineWidth=0.5;"
+            "for(let ti=1;ti<3;ti++){"
+              "ctx.beginPath();ctx.moveTo(cx+cw*ti/3,cy);ctx.lineTo(cx+cw*ti/3,cy+ch);ctx.stroke();"
+              "ctx.beginPath();ctx.moveTo(cx,cy+ch*ti/3);ctx.lineTo(cx+cw,cy+ch*ti/3);ctx.stroke();}"
+          "}"
+        "}"
+    );
+
+    // JS: eventos e handlers
+    server.sendContent(
+        "function wire(s,v){const e=document.getElementById(s);"
+          "e.addEventListener('input',()=>{document.getElementById(v).textContent=e.value;render();});}"
+        "wire('sBri','vBri');wire('sCon','vCon');wire('sSat','vSat');"
+        "wire('sSha','vSha');wire('sHil','vHil');wire('sTemp','vTemp');wire('sFade','vFade');"
+        "wire('sVig','vVig');wire('sCA','vCA');"
+        "wire('sPsMin','vPsMin');wire('sPsMax','vPsMax');"
+        "wire('sEBsz','vEBsz');wire('sELvl','vELvl');"
+        "wire('sAcSz','vAcSz');"
+        "wire('sCrSc','vCrSc');wire('sCrX','vCrX');wire('sCrY','vCrY');"
+
+        // estado e handlers do pixel sort
+        "let psOn=false,psDir='h',psKey='luma';"
+        "function setPsDir(d){"
+          "psDir=d;"
+          "document.getElementById('bPsH').classList.toggle('on',d==='h');"
+          "document.getElementById('bPsV').classList.toggle('on',d==='v');"
+          "if(psOn)render();}"
+        "function setPsKey(k){"
+          "psKey=k;"
+          "['bPsLuma','bPsHue','bPsSat'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "const m={luma:'bPsLuma',hue:'bPsHue',sat:'bPsSat'};"
+          "document.getElementById(m[k]).classList.add('on');"
+          "if(psOn)render();}"
+        "document.getElementById('bPsH').onclick=()=>setPsDir('h');"
+        "document.getElementById('bPsV').onclick=()=>setPsDir('v');"
+        "document.getElementById('bPsLuma').onclick=()=>setPsKey('luma');"
+        "document.getElementById('bPsHue').onclick=()=>setPsKey('hue');"
+        "document.getElementById('bPsSat').onclick=()=>setPsKey('sat');"
+        "document.getElementById('bPxSort').onclick=()=>{"
+          "psOn=!psOn;"
+          "const b=document.getElementById('bPxSort');"
+          "b.classList.toggle('on',psOn);"
+          "b.innerHTML=psOn?'&#8801; sort: on':'&#8801; sort: off';"
+          "render();};"
+
+        "function setFilt(f){"
+          "filt=(filt===f)?null:f;"
+          "['bGray','bSepia','bInvert','bNoir'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "const m={gray:'bGray',sepia:'bSepia',invert:'bInvert',noir:'bNoir'};"
+          "if(filt)document.getElementById(m[filt]).classList.add('on');render();}"
+        "document.getElementById('bGray').onclick=()=>setFilt('gray');"
+        "document.getElementById('bSepia').onclick=()=>setFilt('sepia');"
+        "document.getElementById('bInvert').onclick=()=>setFilt('invert');"
+        "document.getElementById('bNoir').onclick=()=>setFilt('noir');"
+
+        "document.getElementById('bRotL').onclick=()=>{rot=(rot+3)%4;render();};"
+        "document.getElementById('bRotR').onclick=()=>{rot=(rot+1)%4;render();};"
+        "document.getElementById('bFlip').onclick=()=>{"
+          "flipH=!flipH;document.getElementById('bFlip').classList.toggle('on',flipH);render();};"
+
+        "function setAsciiCs(i){"
+          "asciiCs=i;"
+          "['bAcCs0','bAcCs1','bAcCs2','bAcCs3'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "document.getElementById('bAcCs'+i).classList.add('on');"
+          "if(asciiOn)render();}"
+        "function setAsciiCol(col){"
+          "asciiCol=col;"
+          "['bAcCmono','bAcCcolor','bAcCgreen','bAcCamber'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "document.getElementById('bAcC'+col).classList.add('on');"
+          "if(asciiOn)render();}"
+        "document.getElementById('bAcCs0').onclick=()=>setAsciiCs(0);"
+        "document.getElementById('bAcCs1').onclick=()=>setAsciiCs(1);"
+        "document.getElementById('bAcCs2').onclick=()=>setAsciiCs(2);"
+        "document.getElementById('bAcCs3').onclick=()=>setAsciiCs(3);"
+        "document.getElementById('bAcCmono').onclick=()=>setAsciiCol('mono');"
+        "document.getElementById('bAcCcolor').onclick=()=>setAsciiCol('color');"
+        "document.getElementById('bAcCgreen').onclick=()=>setAsciiCol('green');"
+        "document.getElementById('bAcCamber').onclick=()=>setAsciiCol('amber');"
+        "document.getElementById('bAscii').onclick=()=>{"
+          "asciiOn=!asciiOn;"
+          "const b=document.getElementById('bAscii');"
+          "b.classList.toggle('on',asciiOn);"
+          "b.innerHTML=asciiOn?'Aa ascii: on':'Aa ascii: off';"
+          "render();};"
+
+        "document.getElementById('bEight').onclick=()=>{"
+          "eightOn=!eightOn;"
+          "const b=document.getElementById('bEight');"
+          "b.classList.toggle('on',eightOn);"
+          "b.innerHTML=eightOn?'&#9632; 8bit: on':'&#9632; 8bit: off';"
+          "render();};"
+
+        "function setRatio(btn,r){"
+          "cropRatio=r;"
+          "['bCrOrig','bCr11','bCr45','bCr169','bCr916','bCr32'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "document.getElementById(btn).classList.add('on');"
+          "render();}"
+        "document.getElementById('bCrOrig').onclick=()=>setRatio('bCrOrig',null);"
+        "document.getElementById('bCr11').onclick=()=>setRatio('bCr11',{w:1,h:1});"
+        "document.getElementById('bCr45').onclick=()=>setRatio('bCr45',{w:4,h:5});"
+        "document.getElementById('bCr169').onclick=()=>setRatio('bCr169',{w:16,h:9});"
+        "document.getElementById('bCr916').onclick=()=>setRatio('bCr916',{w:9,h:16});"
+        "document.getElementById('bCr32').onclick=()=>setRatio('bCr32',{w:3,h:2});"
+        "document.getElementById('bCrApply').onclick=()=>{"
+          "if(!cropRatio)return;"
+          "const CW=c.width,CH=c.height,rw=cropRatio.w,rh=cropRatio.h;"
+          "let cw,ch;"
+          "if(rw/rh>CW/CH){cw=CW;ch=Math.round(CW*rh/rw);}else{ch=CH;cw=Math.round(CH*rw/rh);}"
+          "const sc=+document.getElementById('sCrSc').value/100;"
+          "cw=Math.max(4,Math.round(cw*sc));ch=Math.max(4,Math.round(ch*sc));"
+          "const px2=+document.getElementById('sCrX').value/100;"
+          "const py2=+document.getElementById('sCrY').value/100;"
+          "const cx=Math.round(px2*(CW-cw)),cy=Math.round(py2*(CH-ch));"
+          "cropRatio=null;render();"
+          "const cd=ctx.getImageData(cx,cy,Math.max(1,cw),Math.max(1,ch));"
+          "c.width=cw;c.height=ch;ctx.putImageData(cd,0,0);"
+          "const t=document.createElement('canvas');t.width=cw;t.height=ch;"
+          "t.getContext('2d').drawImage(c,0,0);"
+          "orig=t.getContext('2d').getImageData(0,0,cw,ch);"
+          "origW=cw;origH=ch;rot=0;flipH=false;"
+          "document.getElementById('status').textContent=cw+'x'+ch+' — cropped';"
+          "document.getElementById('sCrSc').value=100;document.getElementById('vCrSc').textContent=100;"
+          "document.getElementById('sCrX').value=50;document.getElementById('vCrX').textContent=50;"
+          "document.getElementById('sCrY').value=50;document.getElementById('vCrY').textContent=50;"
+          "setRatio('bCrOrig',null);};"
+
+        "document.getElementById('bReset').onclick=()=>{"
+          "['sBri','sCon','sSat','sSha','sHil','sTemp','sFade','sVig','sCA'].forEach(s=>document.getElementById(s).value=0);"
+          "['vBri','vCon','vSat','vSha','vHil','vTemp','vFade','vVig','vCA'].forEach(v=>document.getElementById(v).textContent=0);"
+          "['sPsMin','sPsMax'].forEach(s=>document.getElementById(s).value=s==='sPsMin'?20:80);"
+          "document.getElementById('vPsMin').textContent=20;document.getElementById('vPsMax').textContent=80;"
+          "filt=null;rot=0;flipH=false;psOn=false;psDir='h';psKey='luma';eightOn=false;cropRatio=null;asciiOn=false;asciiCs=0;asciiCol='mono';"
+          "document.getElementById('bFlip').classList.remove('on');"
+          "['bGray','bSepia','bInvert','bNoir'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "setRatio('bCrOrig',null);"
+          "document.getElementById('sCrSc').value=100;document.getElementById('vCrSc').textContent=100;"
+          "document.getElementById('sCrX').value=50;document.getElementById('vCrX').textContent=50;"
+          "document.getElementById('sCrY').value=50;document.getElementById('vCrY').textContent=50;"
+          "document.getElementById('bPxSort').classList.remove('on');"
+          "document.getElementById('bPxSort').innerHTML='&#8801; sort: off';"
+          "document.getElementById('bEight').classList.remove('on');"
+          "document.getElementById('bEight').innerHTML='&#9632; 8bit: off';"
+          "document.getElementById('sEBsz').value=8;document.getElementById('vEBsz').textContent=8;"
+          "document.getElementById('sELvl').value=4;document.getElementById('vELvl').textContent=4;"
+          "document.getElementById('bAscii').classList.remove('on');"
+          "document.getElementById('bAscii').innerHTML='Aa ascii: off';"
+          "document.getElementById('sAcSz').value=8;document.getElementById('vAcSz').textContent=8;"
+          "setAsciiCs(0);setAsciiCol('mono');"
+          "document.getElementById('bPsH').classList.add('on');"
+          "document.getElementById('bPsV').classList.remove('on');"
+          "document.getElementById('bPsLuma').classList.add('on');"
+          "['bPsHue','bPsSat'].forEach(id=>document.getElementById(id).classList.remove('on'));"
+          "render();};"
+    );
+
+    {static const char _s[] =
+        "document.getElementById('bSave').onclick=()=>{"
+          "const b=document.getElementById('bSave');"
+          "b.classList.add('on');b.textContent='uploading...';"
+          "c.toBlob(blob=>{"
+            "const fd=new FormData();"
+            "fd.append('f',blob,'edit.jpg');"
+            "fetch('/save-edit',{method:'POST',body:fd})"
+            ".then(r=>r.ok?r.text():Promise.reject())"
+            ".then(fname=>{"
+              "const a=document.createElement('a');"
+              "a.href='/sd/'+fname;a.download=fname;"
+              "document.body.appendChild(a);a.click();document.body.removeChild(a);"
+            "})"
+            ".catch(()=>alert('save error'))"
+            ".finally(()=>{b.classList.remove('on');b.textContent='\\u2195 save';});"
+          "},'image/jpeg',0.92);};"
+        "</script></body></html>";
+    server.sendContent(_s, sizeof(_s)-1);}
+}
+
+// ─── Upload de imagem editada → salva no SD e serve como download ────────────
+
+static File editUpFile;
+static char editSavedName[32] = "";
+
+void handleSaveEditUpload() {
+    if (!sdOK) return;
+    HTTPUpload& up = server.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        photoCount++;
+        snprintf(editSavedName, sizeof(editSavedName), "EDIT_%04d.JPG", photoCount);
+        char path[36];
+        snprintf(path, sizeof(path), "/%s", editSavedName);
+        editUpFile = SD_MMC.open(path, FILE_WRITE);
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (editUpFile) editUpFile.write(up.buf, up.currentSize);
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (editUpFile) editUpFile.close();
+    }
+}
+
+void handleSaveEdit() {
+    if (!sdOK || editSavedName[0] == '\0') {
+        server.send(500, "text/plain", "no sd");
+        return;
+    }
+    server.send(200, "text/plain", editSavedName);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void handleLog() {
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain; charset=utf-8", "");
+    char line[LOG_W];
+    for (int i = 0; logGet(i, line); i++) {
+        server.sendContent(line);
+        server.sendContent("\n");
+    }
+}
+
+void handleRoot() {
+    if (wifiSetup) { handleSetupPage(); return; }  // portal ativo: delega pro setup
+    String html =
+        "<html><head><meta name='viewport' content='width=device-width'>"
+        "<style>body{background:#000;color:#0f0;font-family:monospace;text-align:center}"
+        "a{color:#0f0}</style></head><body>"
+        "<h2>CYBER SHOT</h2>"
+        "<p><a href='/galeria'>SD gallery</a> &nbsp; <a href='/log'>[log]</a></p>";
+    if (photoReady)
+        html += "<p><a href='/foto'>last photo (RAM)</a>"
+                " &nbsp; <a href='/editor?ram=1'>[edit]</a></p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleFoto() {
+    if (!photoReady) { server.send(404, "text/plain", "no photo"); return; }
+    server.sendHeader("Content-Disposition", "inline; filename=cybershot.jpg");
+    server.send_P(200, "image/jpeg", (const char*)photoBuf, photoLen);
+}
+
+void handleGallery() {
+    if (esp_get_free_heap_size() < 18000) {
+        server.send(503, "text/plain", "low memory - try again");
+        return;
+    }
+    // Array estático: sem heap, sem vector, sem std::bad_alloc
+    // 512 * 32 = 16KB em BSS — não afeta heap
+    static char fileNames[512][32];
+    int fileCount = 0;
+
+    if (sdOK) {
+        File root = SD_MMC.open("/");
+        File f = root.openNextFile();
+        while (f && fileCount < 512) {
+            const char* n = f.name();
+            int len = strlen(n);
+            if (len > 4 && (strcasecmp(n + len - 4, ".JPG") == 0)) {
+                strncpy(fileNames[fileCount], n, 31);
+                fileNames[fileCount][31] = '\0';
+                fileCount++;
+            }
+            f = root.openNextFile();
+        }
+        root.close();
+        // ordena decrescente (mais recente primeiro) sem alocação dinâmica
+        for (int i = 0; i < fileCount - 1; i++)
+            for (int j = i + 1; j < fileCount; j++)
+                if (strcmp(fileNames[i], fileNames[j]) < 0) {
+                    char tmp[32];
+                    memcpy(tmp, fileNames[i], 32);
+                    memcpy(fileNames[i], fileNames[j], 32);
+                    memcpy(fileNames[j], tmp, 32);
+                }
+    }
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    server.sendContent(
+        "<!DOCTYPE html><html><head>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta charset='utf-8'><title>gallery</title>"
+        "<style>"
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{background:#0a0a0a;color:#ccc;font-family:monospace;padding:10px}"
+        "h2{text-align:center;color:#0f0;font-size:15px;margin-bottom:4px}"
+        ".info{text-align:center;font-size:10px;color:#444;margin-bottom:10px}"
+        ".nav a{color:#0f0;font-size:12px;text-decoration:none}"
+        ".nav{margin-bottom:10px}"
+        ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}"
+        ".card{background:#161616;border-radius:5px;overflow:hidden;border:1px solid #222}"
+        ".card.ram{grid-column:1/-1}"
+        ".thumb{width:100%;height:110px;object-fit:cover;display:block;cursor:pointer}"
+        ".thumb:active{opacity:.7}"
+        ".card.ram .thumb{height:160px}"
+        ".name{font-size:9px;color:#555;padding:3px 6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+        ".acts{display:flex;gap:3px;padding:4px 6px 6px}"
+        ".acts a{flex:1;text-align:center;padding:5px 2px;font-size:10px;border-radius:3px;"
+                "text-decoration:none;border:1px solid;font-family:monospace;}"
+        ".ae{color:#0f0;border-color:#0a3a0a;background:#0d1a0d}"
+        ".ab{color:#08f;border-color:#0a1a3a;background:#0d0f1a}"
+        ".ad{color:#f44;border-color:#3a0a0a;background:#1a0d0d;cursor:pointer}"
+        ".empty{grid-column:1/-1;text-align:center;color:#333;font-size:12px;padding:30px 0}"
+        "</style></head><body>"
+    );
+
+    // cabeçalho da galeria
+    char hdr[60];
+    snprintf(hdr, sizeof(hdr), "<h2>GALLERY</h2><div class='info'>%d photos on SD</div>", fileCount);
+    server.sendContent(hdr);
+    server.sendContent("<div class='nav'><a href='/'>&#8592; home</a></div><div class='grid'>");
+
+    // última foto em RAM — card full-width no topo
+    if (photoReady) {
+        server.sendContent(
+            "<div class='card ram'>"
+            "<img class='thumb' src='/foto' loading='lazy' onclick=\"window.open('/foto')\">"
+            "<div class='name'>&#9679; last photo (RAM)</div>"
+            "<div class='acts'>"
+            "<a class='ae' href='/editor?ram=1'>edit</a>"
+            "<a class='ab' href='/foto' download>save</a>"
+            "</div></div>"
+        );
+    }
+
+    if (fileCount == 0) {
+        server.sendContent("<div class='empty'>SD empty</div>");
+    } else {
+        char card[640];
+        for (int fi = 0; fi < fileCount; fi++) {
+            const char* n = fileNames[fi];
+            snprintf(card, sizeof(card),
+                "<div class='card' id='c_%s'>"
+                "<img class='thumb' src='/sd/%s' loading='lazy'"
+                " onclick=\"window.open('/sd/%s')\">"
+                "<div class='name'>%s</div>"
+                "<div class='acts'>"
+                "<a class='ae' href='/editor?file=%s'>edit</a>"
+                "<a class='ab' href='/sd/%s' download>save</a>"
+                "<a class='ad' onclick=\"delFoto('%s');return false\">&#10005;</a>"
+                "</div></div>",
+                n, n, n, n, n, n, n
+            );
+            server.sendContent(card);
+        }
+    }
+
+    server.sendContent(
+        "</div>"
+        "<script>"
+        "function delFoto(n){"
+          "if(!confirm('Delete '+n+'?'))return;"
+          "fetch('/delete?file='+n).then(r=>{"
+            "if(r.ok){const c=document.getElementById('c_'+n);"
+              "if(c)c.remove();}"
+            "else alert('delete error');"
+          "});}"
+        "</script></body></html>"
+    );
+}
+
+void handleDelete() {
+    String file = server.arg("file");
+    if (!file.length()) { server.send(400, "text/plain", "no file"); return; }
+    if (!sdOK) { server.send(503, "text/plain", "no sd"); return; }
+    String path = "/" + file;
+    if (!SD_MMC.exists(path)) { server.send(404, "text/plain", "not found"); return; }
+    SD_MMC.remove(path);
+    server.send(200, "text/plain", "ok");
+}
+
+void handleSDFile() {
+    String uri = server.uri();
+    if (!uri.startsWith("/sd/")) { server.send(404, "text/plain", "not found"); return; }
+    String path = "/" + uri.substring(4);
+    if (!sdOK || !SD_MMC.exists(path)) { server.send(404, "text/plain", "file not found"); return; }
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) { server.send(500, "text/plain", "open error"); return; }
+    server.sendHeader("Cache-Control", "max-age=86400, public");
+    server.streamFile(f, "image/jpeg");
+    f.close();
+}
+
+// ─── Introdução de boot ──────────────────────────────────────────────────────
+
+static void typePrint(const char* s, int x, int y, uint8_t sz, uint16_t col, int ms) {
+    tft.setTextSize(sz);
+    tft.setTextColor(col);
+    for (int i = 0; s[i]; i++) {
+        tft.setCursor(x + i * 6 * sz, y);
+        tft.print(s[i]);
+        if (ms > 0) delay(ms);
+    }
+}
+
+// Intro com scramble animado do logo CBLNDR (2 linhas × 3 chars, textSize=6).
+// Colunas travam em pares: C+N → B+D → L+R, com pulso de LED em cada travamento.
+
+static void bootIntro() {
+    const uint16_t gc = 0x07E0;   // verde brilhante (scramble / cantos)
+    const uint16_t gd = 0x03C0;   // verde escuro    (separador / handles)
+
+    tft.fillScreen(ST77XX_BLACK);
+
+    // cantos do viewfinder crescem antes do scramble
+    for (int m = 1; m <= 10; m++) {
+        tft.drawPixel(m - 1,   0,       gc);
+        tft.drawPixel(0,       m - 1,   gc);
+        tft.drawPixel(160 - m, 0,       gc);
+        tft.drawPixel(159,     m - 1,   gc);
+        tft.drawPixel(m - 1,   127,     gc);
+        tft.drawPixel(0,       128 - m, gc);
+        tft.drawPixel(160 - m, 127,     gc);
+        tft.drawPixel(159,     128 - m, gc);
+        delay(14);
+    }
+    delay(80);
+
+    // scramble CBLNDR: par C+N (step 0), B+D (step 4), L+R (step 8)
+    const char*  target = "CBLNDR";
+    const int8_t px[6]  = { 26, 62, 98, 26, 62, 98 };
+    const int8_t py[6]  = {  4,  4,  4, 56, 56, 56 };
+
+    tft.setTextSize(6);
+    for (int step = 0; step < 15; step++) {
+        bool flash = false;
+        // ~25% de chance de re-scramble em char travado → instabilidade visual
+        int reglitch = (step >= 4 && random(4) == 0) ? random(6) : -1;
+
+        for (int i = 0; i < 6; i++) {
+            tft.fillRect(px[i], py[i], 36, 48, ST77XX_BLACK);
+            char c;
+            uint16_t col;
+            bool settled = (step >= (i % 3) * 4) && (i != reglitch);
+            if (settled) {
+                c = target[i]; col = ST77XX_WHITE;
+                if (step == (i % 3) * 4) flash = true;
+            } else {
+                c = (char)('A' + random(26)); col = gc;
+            }
+            tft.setTextColor(col);
+            tft.setCursor(px[i], py[i]);
+            tft.print(c);
+        }
+        if (flash) digitalWrite(LED_FLASH, HIGH);
+        delay(62);
+        if (flash) digitalWrite(LED_FLASH, LOW);
+    }
+
+    // glitch agressivo: 9 bursts de 1–3 chars simultâneos
+    for (int g = 0; g < 9; g++) {
+        int n = 1 + random(3);
+        int pos[3] = { random(6), random(6), random(6) };
+        if (n > 1 && pos[1] == pos[0]) pos[1] = (pos[0] + 1) % 6;
+        if (n > 2 && (pos[2] == pos[0] || pos[2] == pos[1])) pos[2] = (pos[1] + 1) % 6;
+
+        bool ledOn = (random(3) == 0);
+        tft.setTextSize(6);
+        for (int k = 0; k < n; k++) {
+            tft.fillRect(px[pos[k]], py[pos[k]], 36, 48, ST77XX_BLACK);
+            tft.setTextColor(gc);
+            tft.setCursor(px[pos[k]], py[pos[k]]);
+            tft.print((char)('A' + random(26)));
+        }
+        if (ledOn) digitalWrite(LED_FLASH, HIGH);
+        delay(14 + random(20));
+        if (ledOn) digitalWrite(LED_FLASH, LOW);
+
+        for (int k = 0; k < n; k++) {
+            tft.fillRect(px[pos[k]], py[pos[k]], 36, 48, ST77XX_BLACK);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setCursor(px[pos[k]], py[pos[k]]);
+            tft.print(target[pos[k]]);
+        }
+        delay(28 + random(38));
+    }
+
+    // finale: scramble total → trava coluna por coluna com LED
+    tft.setTextSize(6);
+    for (int i = 0; i < 6; i++) {
+        tft.fillRect(px[i], py[i], 36, 48, ST77XX_BLACK);
+        tft.setTextColor(gc);
+        tft.setCursor(px[i], py[i]);
+        tft.print((char)('A' + random(26)));
+    }
+    digitalWrite(LED_FLASH, HIGH);
+    delay(100);
+    digitalWrite(LED_FLASH, LOW);
+    for (int i = 0; i < 6; i++) {
+        tft.fillRect(px[i], py[i], 36, 48, ST77XX_BLACK);
+        tft.setTextColor(ST77XX_WHITE);
+        tft.setCursor(px[i], py[i]);
+        tft.print(target[i]);
+        delay(20);
+    }
+    delay(140);
+
+    // separador e handles de autoria
+    for (int x = 26; x <= 134; x += 4) {
+        tft.drawFastHLine(26, 106, x - 26, gd);
+        delay(6);
+    }
+
+    typePrint("@cebolander",    47, 111, 1, ST77XX_WHITE, 32);
+    typePrint("@lixofuturista", 38, 119, 1, ST77XX_WHITE, 22);
+
+    delay(2000);
+}
+
+// ─── Inicialização ───────────────────────────────────────────────────────────
+
+void setup() {
+    Serial.begin(115200);
+    if (logMagic != LOG_MAGIC || logHead < 0 || logHead >= LOG_LINES || logCount < 0 || logCount > LOG_LINES) {
+        logMagic = LOG_MAGIC; logHead = 0; logCount = 0;   // RAM sem log válido (energizou agora)
+    } else {
+        logPush("---------- reset ----------");            // mantém o log da sessão anterior
+    }
+    logOrigVprintf = esp_log_set_vprintf(logVprintf);   // erros do driver da câmera → log em RAM
+    esp_reset_reason_t rst = esp_reset_reason();
+    dlog("[BOOT] rst=%d (%s) heap=%u", rst,
+         rst == ESP_RST_POWERON  ? "poweron"  : rst == ESP_RST_SW    ? "sw"    :
+         rst == ESP_RST_BROWNOUT ? "BROWNOUT" : rst == ESP_RST_PANIC ? "panic" :
+         (rst == ESP_RST_INT_WDT || rst == ESP_RST_TASK_WDT || rst == ESP_RST_WDT) ? "wdt" : "?",
+         esp_get_free_heap_size());
+    pinMode(BTN_PIN,   INPUT_PULLUP);
+    pinMode(LED_FLASH, OUTPUT);
+    digitalWrite(LED_FLASH, LOW);
+    pinMode(JOY_SW,  INPUT_PULLUP);
+
+    tftSPI.begin(TFT_SCK, -1, TFT_SDA, -1);
+    tft.initR(INITR_BLACKTAB);
+    tft.setSPISpeed(40000000);
+    tft.setRotation(1);
+    tft.fillScreen(ST77XX_BLACK);
+
+    photoBuf = nullptr;
+
+    // ── Fases 1 e 2 ──────────────────────────────────────────────────────────
+    // intro sempre: no S3 o XCLK vem do LCD_CAM e só para no reset do chip — o sensor
+    // precisa desses segundos sem clock para voltar de um travamento
+    bootIntro();
+
+    // ── Fase 3 — CYBERSHOT DIY + verificação dos sistemas ───────────────────
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(0x07E0);
+    tft.setCursor(8, 6);
+    tft.print("CYBERSHOT DIY");
+    tft.drawFastHLine(0, 17, 160, 0x03E0);
+
+    // SD
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(8, 26); tft.print("SD   ...");
+    SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN);
+    sdOK = SD_MMC.begin("/sdcard", true);
+    tft.fillRect(0, 26, 160, 8, ST77XX_BLACK);
+    tft.setCursor(8, 26);
+    if (sdOK) {
+        tft.setTextColor(ST77XX_GREEN);
+        tft.printf("SD   OK  %lluMB", SD_MMC.totalBytes() / (1024 * 1024));
+        File root = SD_MMC.open("/");
+        File f = root.openNextFile();
+        while (f) {
+            if (!f.isDirectory()) {
+                const char* name = f.name();
+                int n = 0;
+                if (sscanf(name, "/PHOTO_%d.JPG", &n) == 1 || sscanf(name, "PHOTO_%d.JPG", &n) == 1)
+                    if (n > photoCount) photoCount = n;
+            }
+            f = root.openNextFile();
+        }
+        root.close();
+    } else {
+        tft.setTextColor(ST77XX_YELLOW);
+        tft.print("SD   no card");
+    }
+
+    // WiFi antes da câmera: init única depois do rádio estabilizar (sem reinit)
+    setupWiFi();
+
+    // Camera
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(8, 38); tft.print("CAM  ...");
+    if (!decBuf) decBuf = (uint8_t*)ps_malloc(DEC_W * DEC_H * 2);
+    if (!vfBuf)  vfBuf  = (uint8_t*)ps_malloc(VF_W * VF_H * 2);
+    if (!decBuf || !vfBuf || !initCamera()) {
+        tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
+        tft.setTextColor(ST77XX_RED);
+        tft.setCursor(8, 38); tft.print("CAM  FAIL");
+        delay(3000);
+        ESP.restart();
+    }
+    tft.fillRect(0, 38, 160, 8, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(8, 38); tft.print("CAM  OK");
+    dlog("[CAM] vsync alive=%d", camVsyncAlive(400));   // auto-verificação da checagem (deve ser 1)
+    delay(300);
+
+    tft.fillScreen(ST77XX_BLACK);
+}
+
+// ─── Menu principal ──────────────────────────────────────────────────────────
+
+// Countdown do timer: pisca LED em ritmo crescente, exibe contagem no TFT.
+void runCountdown() {
+    uint16_t bright  = vfPalettes[vfColorIdx][3];
+    uint16_t accent  = vfPalettes[vfColorIdx][2];
+    unsigned long total   = (unsigned long)timerSecs * 1000;
+    unsigned long endTime = millis() + total;
+    int lastSec = -1;
+
+    while (millis() < endTime) {
+        unsigned long remaining = endTime - millis();
+
+        // Atualiza display a cada segundo
+        int sec = (int)((remaining + 999) / 1000);
+        if (sec != lastSec) {
+            lastSec = sec;
+            tft.fillScreen(ST77XX_BLACK);
+            tft.setTextColor(accent);
+            tft.setTextSize(1);
+            tft.setCursor(60, 8);
+            tft.print("TIMER");
+            tft.setTextColor(bright);
+            tft.setTextSize(6);
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%d", sec);
+            int tw = (int)strlen(buf) * 36;
+            tft.setCursor((160 - tw) / 2, 38);
+            tft.print(buf);
+        }
+
+        // Período de pisca: 800ms no início → 100ms no final
+        unsigned long period = 100 + (700UL * remaining / total);
+        unsigned long half   = period / 2;
+
+        digitalWrite(LED_FLASH, HIGH);
+        delay(half);
+        if (millis() >= endTime) break;
+        digitalWrite(LED_FLASH, LOW);
+        delay(half);
+    }
+
+    digitalWrite(LED_FLASH, LOW);
+}
+
+void wifiDisconnect() {
+    dnsServer.stop();
+    server.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true);
+    wifiOK    = false;
+    wifiAP    = false;
+    wifiSetup = false;
+}
+
+void switchToDirectAP() {
+    server.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("CYBERSHOT");   // sem senha — acesso direto
+    WiFi.setTxPower(WIFI_POWER_15dBm);
+    wifiOK    = true;
+    wifiAP    = true;
+    wifiSetup = false;
+    delay(200);
+    setupWebServer();
+}
+
+// ─── Submenu WiFi ─────────────────────────────────────────────────────────────
+
+void drawWiFiMenu() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+
+    tft.setTextColor(0x07C0);
+    tft.setCursor(44, 4);
+    tft.print("-- WIFI --");
+    tft.drawFastHLine(0, 14, 160, 0x0260);
+
+    // Status
+    tft.setCursor(8, 17);
+    if (wifiSetup) {
+        tft.setTextColor(ST77XX_YELLOW);
+        tft.print("Setup portal active");
+        tft.setCursor(8, 26); tft.setTextColor(0x7BEF);
+        tft.print("  192.168.4.1");
+    } else if (wifiOK && !wifiAP) {
+        tft.setTextColor(ST77XX_GREEN);
+        tft.print("Connected (STA)");
+        tft.setCursor(8, 26); tft.setTextColor(0x07E0);
+        tft.printf("  %s", WiFi.localIP().toString().c_str());
+    } else if (wifiOK && wifiAP) {
+        tft.setTextColor(ST77XX_CYAN);
+        tft.print("AP mode (CYBERSHOT)");
+        tft.setCursor(8, 26); tft.setTextColor(0x07FF);
+        tft.printf("  %s", WiFi.softAPIP().toString().c_str());
+    } else {
+        tft.setTextColor(0x7BEF);
+        tft.print("Offline");
+        String ssid, pass;
+        if (loadWiFiCreds(ssid, pass)) {
+            tft.setCursor(8, 26); tft.setTextColor(0x4208);
+            tft.printf("  saved: %s", ssid.c_str());
+        }
+    }
+
+    tft.drawFastHLine(0, 36, 160, 0x0260);
+
+    const char* items[] = { "CONFIGURE", "CONNECT STA", "DIRECT AP", "DISCONNECT", "BACK" };
+    for (int i = 0; i < 5; i++) {
+        int iy = 39 + i * 16;
+        bool sel = (i == wifiMenuSel);
+        tft.fillRect(0, iy, 160, 14, sel ? 0x0260 : ST77XX_BLACK);
+        tft.setTextColor(sel ? ST77XX_BLACK : ST77XX_WHITE);
+        tft.setCursor(8, iy + 3);
+        tft.print(items[i]);
+    }
+
+    tft.setTextColor(0x2965);
+    tft.setCursor(4, 120);
+    tft.print("[BTN]=OK  [HOLD]=back");
+}
+
+void connectSTA() {
+    String ssid, pass;
+    if (!loadWiFiCreds(ssid, pass)) {
+        tft.fillRect(0, 17, 160, 18, ST77XX_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_YELLOW);
+        tft.setCursor(8, 17); tft.print("No saved network.");
+        tft.setCursor(8, 26); tft.print("Use CONFIGURE first.");
+        delay(2500);
+        drawWiFiMenu();
+        return;
+    }
+    wifiDisconnect();
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(8, 50); tft.print("Connecting to:");
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(8, 62); tft.print(ssid.c_str());
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long t = millis();
+    while (millis() - t < 10000 && WiFi.status() != WL_CONNECTED) delay(200);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiOK = true; wifiAP = false; wifiSetup = false;
+        setupWebServer();
+        tft.setTextColor(ST77XX_GREEN);
+        tft.setCursor(8, 76); tft.printf("IP: %s", WiFi.localIP().toString().c_str());
+        delay(1500);
+    } else {
+        WiFi.disconnect(true);
+        tft.setTextColor(ST77XX_RED);
+        tft.setCursor(8, 76); tft.print("Failed to connect.");
+        delay(2000);
+    }
+    drawWiFiMenu();
+}
+
+const char* MENU_ITEMS[] = { "VF COLOR", "LONG EXP", "TIMER", "EFFECTS", "WIFI", "FORMAT SD CARD", "EXIT" };
+const int   MENU_N       = 7;
+
+void drawMenu() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(0x07C0);
+    tft.setCursor(50, 5);
+    tft.print("-- MENU --");
+    tft.drawFastHLine(0, 15, 160, 0x0260);
+
+    // 7 itens: y = 17 + i*15, h=12; hint em 120 sobrepõe o último (ok)
+    for (int i = 0; i < MENU_N; i++) {
+        int iy = 17 + i * 15;
+        if (i == menuSel) {
+            tft.fillRect(0, iy, 160, 12, 0x0260);
+            tft.setTextColor(ST77XX_BLACK);
+        } else {
+            tft.fillRect(0, iy, 160, 12, ST77XX_BLACK);
+            tft.setTextColor(ST77XX_WHITE);
+        }
+        tft.setCursor(8, iy + 2);
+        if (i == 1) {
+            char lb[22];
+            if (leSeconds == 0) snprintf(lb, sizeof(lb), "LONG EXP: OFF");
+            else                snprintf(lb, sizeof(lb), "LONG EXP: %dS", leSeconds);
+            tft.print(lb);
+        } else if (i == 2) {
+            const char* ts = timerSecs == 0 ? "OFF" :
+                             timerSecs == 3 ? "3S"  :
+                             timerSecs == 5 ? "5S"  : "10S";
+            char lb[22];
+            snprintf(lb, sizeof(lb), "TIMER: %s", ts);
+            tft.print(lb);
+        } else if (i == 3) {
+            int n = (int)fxDQT + (int)fxScan + (int)fxChroma + (int)fxZigzag + (int)fxDHT;
+            char lb[22];
+            if (n > 0) snprintf(lb, sizeof(lb), "EFFECTS [%d]", n);
+            else       snprintf(lb, sizeof(lb), "EFFECTS");
+            tft.print(lb);
+        } else if (i == 4) {
+            char lb[22];
+            if (wifiSetup || !wifiOK) snprintf(lb, sizeof(lb), "WIFI: setup");
+            else if (wifiAP)          snprintf(lb, sizeof(lb), "WIFI: AP");
+            else                      snprintf(lb, sizeof(lb), "WIFI: %s", WiFi.localIP().toString().c_str());
+            tft.print(lb);
+        } else {
+            tft.print(MENU_ITEMS[i]);
+        }
+    }
+
+    tft.setTextColor(0x02A0);
+    tft.setCursor(4, 120);
+    tft.print("[BTN]=OK  [HOLD]=exit");
+}
+
+void drawConfirmFormat() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_RED);
+    tft.setTextSize(1);
+    tft.setCursor(8, 8);
+    tft.print("FORMAT SD CARD");
+    tft.drawFastHLine(0, 18, 160, ST77XX_RED);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(8, 26);
+    tft.print("Erases ALL on SD.");
+    tft.setCursor(8, 38);
+    tft.print("Are you sure?");
+
+    if (confirmSel == 0) {
+        tft.fillRoundRect(8,  62, 60, 20, 4, ST77XX_RED);
+        tft.setTextColor(ST77XX_WHITE);
+    } else {
+        tft.drawRoundRect(8,  62, 60, 20, 4, 0x0260);
+        tft.setTextColor(0x0260);
+    }
+    tft.setCursor(26, 68); tft.print("YES");
+
+    if (confirmSel == 1) {
+        tft.fillRoundRect(92, 62, 60, 20, 4, 0x0260);
+        tft.setTextColor(ST77XX_BLACK);
+    } else {
+        tft.drawRoundRect(92, 62, 60, 20, 4, 0x0260);
+        tft.setTextColor(0x0260);
+    }
+    tft.setCursor(110, 68); tft.print("NO");
+
+    tft.setTextColor(0x02A0);
+    tft.setCursor(4, 120);
+    tft.print("[JOY]=sel  [BTN]=OK");
+}
+
+bool formatSDCard() {
+    if (!sdOK) return false;
+    File root = SD_MMC.open("/");
+    if (!root || !root.isDirectory()) return false;
+    File f = root.openNextFile();
+    while (f) {
+        if (!f.isDirectory()) {
+            String path = f.path();
+            f.close();
+            SD_MMC.remove(path.c_str());
+        } else {
+            f.close();
+        }
+        f = root.openNextFile();
+    }
+    root.close();
+    photoCount = 0;
+    photoReady = false;
+    return true;
+}
+
+// ─── Seletor de efeitos ──────────────────────────────────────────────────────
+
+const char* FX_NAMES[] = { "DQT EROSION", "SCAN SWAP", "CHROMA AMP", "ZIGZAG PERM", "DHT REMAP" };
+const int   FX_N       = 5;
+
+void drawEffectsMenu() {
+    bool* flags[FX_N] = { &fxDQT, &fxScan, &fxChroma, &fxZigzag, &fxDHT };
+    uint16_t accent = vfPalettes[vfColorIdx][2];
+    uint16_t bright = vfPalettes[vfColorIdx][3];
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+
+    tft.setTextColor(bright);
+    tft.setCursor(30, 4);
+    tft.print("-- EFFECTS --");
+    tft.drawFastHLine(0, 14, 160, accent);
+
+    const int ITEM_Y[5] = { 18, 36, 54, 72, 90 };
+
+    for (int i = 0; i < FX_N; i++) {
+        bool active = *flags[i];
+        bool sel    = (i == effectsSel);
+        int  y      = ITEM_Y[i];
+        tft.fillRect(0, y, 160, 16, sel ? accent : ST77XX_BLACK);
+        tft.setTextColor(sel ? ST77XX_BLACK : (active ? bright : 0x7BEF));
+        tft.drawRect(2, y + 4, 8, 8, sel ? ST77XX_BLACK : accent);
+        if (active) tft.fillRect(4, y + 6, 4, 4, sel ? ST77XX_BLACK : bright);
+        tft.setCursor(14, y + 4);
+        tft.print(FX_NAMES[i]);
+    }
+
+    tft.setTextColor(0x02A0);
+    tft.setCursor(4, 120);
+    tft.print("[BTN]=toggle [SW]=exit");
+}
+
+// ─── Seletor de cor do viewfinder ────────────────────────────────────────────
+
+void drawVfColorSelect() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(0x07C0);
+    tft.setCursor(22, 4);
+    tft.print("VF COLOR");
+    tft.drawFastHLine(0, 14, 160, 0x0260);
+
+    for (int i = 0; i < 5; i++) {
+        bool sel = (i == vfColorIdx);
+        uint16_t bright = vfPalettes[i][3];
+        uint16_t mid    = vfPalettes[i][2];
+        int y = 18 + i * 20;
+        if (sel) {
+            tft.fillRect(0, y, 160, 18, mid);
+            tft.setTextColor(ST77XX_BLACK);
+        } else {
+            tft.fillRect(0, y, 160, 18, ST77XX_BLACK);
+            tft.fillRect(2, y + 3, 12, 12, bright);
+            tft.setTextColor(ST77XX_WHITE);
+        }
+        tft.setCursor(20, y + 5);
+        tft.print(VF_COLOR_NAMES[i]);
+    }
+
+    tft.setTextColor(0x02A0);
+    tft.setCursor(4, 122);
+    tft.print("[JOY]=sel  [BTN]=OK");
+}
+
+// ─── Leitura do botão ────────────────────────────────────────────────────────
+
+void handleButton() {
+    static bool          lastBtn     = HIGH;
+    static unsigned long pressTime   = 0;
+    static bool          longHandled = false;
+
+    bool btn = digitalRead(BTN_PIN);
+
+    if (btn == LOW && lastBtn == HIGH) {
+        pressTime   = millis();
+        longHandled = false;
+    }
+
+    if (btn == LOW && !longHandled && (millis() - pressTime > 800)) {
+        longHandled = true;
+        if (wifiSetup) {
+            wifiDisconnect();
+            appState = STATE_VF; vfNeedsClear = true;
+        } else if (appState == STATE_WIFI) {
+            appState = STATE_MENU; drawMenu();
+        } else if (appState == STATE_VF) {
+            appState = STATE_MENU;
+            menuSel  = 0;
+            drawMenu();
+        } else {
+            appState = STATE_VF; vfNeedsClear = true;
+        }
+    }
+
+    if (btn == HIGH && lastBtn == LOW && !longHandled && (millis() - pressTime > 30)) {
+        if (appState == STATE_VF) {
+            if (timerSecs > 0) runCountdown();
+            takePhoto();
+        } else if (appState == STATE_MENU) {
+            if (menuSel == 0) {
+                appState = STATE_VF_COLOR;
+                drawVfColorSelect();
+            } else if (menuSel == 1) {
+                if      (leSeconds == 0)  leSeconds = 3;
+                else if (leSeconds == 3)  leSeconds = 5;
+                else if (leSeconds == 5)  leSeconds = 10;
+                else                      leSeconds = 0;
+                applyVfExposure();
+                drawMenu();
+            } else if (menuSel == 2) {
+                // cicla timer: 0 → 3 → 5 → 10 → 0
+                const int opts[] = {0, 3, 5, 10};
+                int ti = 0;
+                for (int j = 0; j < 4; j++) if (opts[j] == timerSecs) { ti = j; break; }
+                timerSecs = opts[(ti + 1) % 4];
+                drawMenu();
+            } else if (menuSel == 3) {
+                appState = STATE_EFFECTS;
+                effectsSel = 0;
+                drawEffectsMenu();
+            } else if (menuSel == 4) {
+                appState = STATE_WIFI;
+                wifiMenuSel = 0;
+                drawWiFiMenu();
+            } else if (menuSel == 5) {
+                confirmSel = 1;
+                appState   = STATE_CONFIRM;
+                drawConfirmFormat();
+            } else {
+                appState = STATE_VF; vfNeedsClear = true;
+            }
+        } else if (appState == STATE_WIFI) {
+            switch (wifiMenuSel) {
+                case 0:  // CONFIGURE → captive portal
+                    wifiDisconnect();
+                    startWiFiPortal();
+                    appState = STATE_VF;
+                    break;
+                case 1:  // CONNECT STA
+                    connectSTA();
+                    break;
+                case 2:  // DIRECT AP
+                    wifiDisconnect();
+                    switchToDirectAP();
+                    drawWiFiMenu();
+                    break;
+                case 3:  // DISCONNECT
+                    wifiDisconnect();
+                    drawWiFiMenu();
+                    break;
+                case 4:  // BACK
+                    appState = STATE_MENU;
+                    drawMenu();
+                    break;
+            }
+        } else if (appState == STATE_EFFECTS) {
+            bool* flags[FX_N] = { &fxDQT, &fxScan, &fxChroma, &fxZigzag, &fxDHT };
+            *flags[effectsSel] = !*flags[effectsSel];
+            drawEffectsMenu();
+        } else if (appState == STATE_VF_COLOR) {
+            appState = STATE_VF; vfNeedsClear = true;
+        } else if (appState == STATE_CONFIRM) {
+            if (confirmSel == 0) {
+                tft.fillScreen(ST77XX_BLACK);
+                tft.setTextColor(ST77XX_WHITE);
+                tft.setTextSize(1);
+                tft.setCursor(30, 58);
+                tft.print("Formatting...");
+                bool ok = formatSDCard();
+                tft.fillScreen(ST77XX_BLACK);
+                tft.setCursor(ok ? 45 : 8, 58);
+                tft.setTextColor(ok ? ST77XX_GREEN : ST77XX_RED);
+                tft.print(ok ? "SD cleared!" : "Format error");
+                delay(2000);
+                appState = STATE_VF; vfNeedsClear = true;
+            } else {
+                appState = STATE_MENU;
+                drawMenu();
+            }
+        }
+    }
+
+    lastBtn = btn;
+}
+
+void handleMenuInput() {
+    static unsigned long lastMove = 0;
+    if (millis() - lastMove < 220) return;
+
+    if (appState == STATE_MENU) {
+        int y = analogRead(JOY_Y);
+        if (y < 1000) {
+            menuSel = (menuSel - 1 + MENU_N) % MENU_N;
+            drawMenu(); lastMove = millis();
+        } else if (y > 3000) {
+            menuSel = (menuSel + 1) % MENU_N;
+            drawMenu(); lastMove = millis();
+        }
+        if (digitalRead(JOY_SW) == LOW) {
+            appState = STATE_VF; vfNeedsClear = true; lastMove = millis();
+        }
+    } else if (appState == STATE_CONFIRM) {
+        int x = analogRead(JOY_X);
+        if (x < 1000 && confirmSel != 1) {
+            confirmSel = 1; drawConfirmFormat(); lastMove = millis();
+        } else if (x > 3000 && confirmSel != 0) {
+            confirmSel = 0; drawConfirmFormat(); lastMove = millis();
+        }
+        if (digitalRead(JOY_SW) == LOW) {
+            appState = STATE_MENU; drawMenu(); lastMove = millis();
+        }
+    } else if (appState == STATE_VF_COLOR) {
+        int y = analogRead(JOY_Y);
+        if (y < 1000) {
+            vfColorIdx = (vfColorIdx - 1 + 5) % 5;
+            drawVfColorSelect(); lastMove = millis();
+        } else if (y > 3000) {
+            vfColorIdx = (vfColorIdx + 1) % 5;
+            drawVfColorSelect(); lastMove = millis();
+        }
+        if (digitalRead(JOY_SW) == LOW) {
+            appState = STATE_MENU; drawMenu(); lastMove = millis();
+        }
+    } else if (appState == STATE_EFFECTS) {
+        int y = analogRead(JOY_Y);
+        if (y < 1000) {
+            effectsSel = (effectsSel - 1 + FX_N) % FX_N;
+            drawEffectsMenu(); lastMove = millis();
+        } else if (y > 3000) {
+            effectsSel = (effectsSel + 1) % FX_N;
+            drawEffectsMenu(); lastMove = millis();
+        }
+        if (digitalRead(JOY_SW) == LOW) {
+            appState = STATE_MENU; drawMenu(); lastMove = millis();
+        }
+    } else if (appState == STATE_WIFI) {
+        int y = analogRead(JOY_Y);
+        if (y < 1000) {
+            wifiMenuSel = (wifiMenuSel - 1 + 5) % 5;
+            drawWiFiMenu(); lastMove = millis();
+        } else if (y > 3000) {
+            wifiMenuSel = (wifiMenuSel + 1) % 5;
+            drawWiFiMenu(); lastMove = millis();
+        }
+        if (digitalRead(JOY_SW) == LOW) {
+            appState = STATE_MENU; drawMenu(); lastMove = millis();
+        }
+    }
+}
+
+void handleVfInput() {
+    static unsigned long lastMove = 0;
+    if (appState != STATE_VF) return;
+    if (millis() - lastMove < 300) return;
+
+    int y = analogRead(JOY_Y);
+    int newEv = evComp;
+    if      (y < 1000 && evComp < 3)  newEv++;
+    else if (y > 3000 && evComp > -3) newEv--;
+    if (newEv == evComp) return;
+
+    int delta = newEv - evComp;  // +1 = mais brilhante, -1 = mais escuro
+    evComp = newEv;
+    lastMove = millis();
+
+    // aplica ao sensor pela direção (delta), não pelo valor absoluto
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return;
+    if (delta > 0) {
+        vfAecValue = min(1200, vfAecValue * 2);
+        if (vfAecValue >= 1200) vfAgcGain = min(30, vfAgcGain + 5);  // ~1 stop extra
+    } else {
+        if (vfAgcGain >= 5) vfAgcGain = max(0,  vfAgcGain - 5);
+        else { vfAgcGain = 0; vfAecValue = max(50, vfAecValue / 2); }
+    }
+    dlog("[EV] %d -> aec %d g %d", evComp, vfAecValue, vfAgcGain);
+    s->set_aec_value(s, vfAecValue);
+    s->set_agc_gain(s, vfAgcGain);
+}
+
+// ─── Loop principal ──────────────────────────────────────────────────────────
+
+void loop() {
+    if (!wifiAP && !wifiOK && WiFi.status() == WL_CONNECTED) {
+        wifiOK = true;
+        setupWebServer();
+    }
+    if (wifiSetup) dnsServer.processNextRequest();
+    if (wifiOK || wifiSetup) server.handleClient();
+
+    handleButton();
+    handleVfInput();
+
+    if (appState != STATE_VF) {
+        handleMenuInput();
+        return;
+    }
+
+    if (wifiSetup) return;   // portal ativo: não roda VF, mantém tela de instrução
+
+    // heartbeat a cada 5 s no log em RAM (heap + fps do viewfinder)
+    static unsigned long lastDbg = 0;
+    static uint32_t dbgFrames = 0;
+    dbgFrames++;
+    if (millis() - lastDbg >= 5000) {
+        dlog("[VF] fps %u luma %d aec %d g %d ev %d heap %u", dbgFrames / 5, vfLastLuma,
+             vfAecValue, vfAgcGain, evComp, esp_get_free_heap_size());
+        dbgFrames = 0;
+        lastDbg = millis();
+    }
+
+    if (vfNeedsClear) {
+        tft.fillScreen(ST77XX_BLACK);
+        vfNeedsClear = false;
+    }
+
+    unsigned long tf = millis();
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+        // sem frame = sensor parado. Reinit não recupera (soft-reset não volta); o boot
+        // completo (reset do chip, segundos sem XCLK) sempre volta.
+        dlog("[VF] no frame %lums -> restart", millis() - tf);
+        delay(100);
+        ESP.restart();
+    }
+
+    bool decoded = decodeEighth(fb->buf, fb->len);
+    esp_camera_fb_return(fb);   // devolve o buffer antes de qualquer chamada SCCB
+    if (!decoded) { delay(1); return; }   // frame parcial/corrompido
+
+    // ~8 fps → AE a cada 5 frames ≈ 1,6×/s (sensor aplica aec/gain em 1–2 frames)
+    bool doAE = (++vfFrameCnt % 5 == 0);
+    int  aeLuma = doAE ? measureLuma(decBuf, DEC_W, DEC_H) : 0;
+    if (doAE) vfLastLuma = aeLuma;
+
+    toGreenTones(decBuf, DEC_W, DEC_H);
+    upscaleToVf();
+
+    tft.startWrite();
+    tft.setAddrWindow(0, (128 - VF_H) / 2, VF_W, VF_H);
+    tft.writePixels((uint16_t*)vfBuf, VF_W * VF_H, true, true);
+    tft.endWrite();
+
+    if (doAE) autoExposure(aeLuma);
+
+    drawViewfinderOverlay();
+}
