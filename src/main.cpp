@@ -141,6 +141,8 @@ int measureLuma(const uint8_t* buf, int w, int h) {
     return count ? (int)(sum / count) : 0;
 }
 
+static void dlog(const char* fmt, ...);   // log em RAM (definido na seção "Log em RAM")
+
 // Alvo de luma com a compensação EV aplicada (usado pelo VF e pela medição da foto).
 static int aeTarget() {
     if (evComp > 0) return min(13000, LUMA_TARGET << evComp);
@@ -178,6 +180,7 @@ void autoExposure(int avgLuma) {
         }
     }
     if (changed) {
+        dlog("[AE] luma %d -> aec %d g %d", avgLuma, vfAecValue, vfAgcGain);
         sensor_t* s = esp_camera_sensor_get();
         if (s) {
             s->set_aec_value(s, vfAecValue);
@@ -206,9 +209,13 @@ WebServer server(80);
 
 static const int LOG_LINES = 64;
 static const int LOG_W     = 64;
-static char          logRing[LOG_LINES][LOG_W];
-static int           logHead  = 0;
-static int           logCount = 0;
+// .noinit: sobrevive a ESP.restart()/panic/WDT (não a desligar) — o /log após um reinício
+// mostra o que aconteceu antes dele. Validado por magic no setup().
+static const uint32_t LOG_MAGIC = 0xC5B0106A;
+__NOINIT_ATTR static uint32_t logMagic;
+__NOINIT_ATTR static char     logRing[LOG_LINES][LOG_W];
+__NOINIT_ATTR static int      logHead;
+__NOINIT_ATTR static int      logCount;
 static portMUX_TYPE  logMux   = portMUX_INITIALIZER_UNLOCKED;
 static vprintf_like_t logOrigVprintf = nullptr;
 
@@ -2376,6 +2383,11 @@ static void bootIntro() {
 
 void setup() {
     Serial.begin(115200);
+    if (logMagic != LOG_MAGIC || logHead < 0 || logHead >= LOG_LINES || logCount < 0 || logCount > LOG_LINES) {
+        logMagic = LOG_MAGIC; logHead = 0; logCount = 0;   // RAM sem log válido (energizou agora)
+    } else {
+        logPush("---------- reset ----------");            // mantém o log da sessão anterior
+    }
     logOrigVprintf = esp_log_set_vprintf(logVprintf);   // erros do driver da câmera → log em RAM
     esp_reset_reason_t rst = esp_reset_reason();
     dlog("[BOOT] rst=%d (%s) heap=%u", rst,
@@ -3014,6 +3026,7 @@ void handleVfInput() {
         if (vfAgcGain >= 5) vfAgcGain = max(0,  vfAgcGain - 5);
         else { vfAgcGain = 0; vfAecValue = max(50, vfAecValue / 2); }
     }
+    dlog("[EV] %d -> aec %d g %d", evComp, vfAecValue, vfAgcGain);
     s->set_aec_value(s, vfAecValue);
     s->set_agc_gain(s, vfAgcGain);
 }
