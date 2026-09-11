@@ -679,6 +679,7 @@ void setupWiFi() {
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), pass.c_str());
+    WiFi.setTxPower(WIFI_POWER_15dBm);   // menos pico de corrente no rádio (hipótese: quedas de tensão travam o OV2640)
     unsigned long t = millis();
     while (millis() - t < 10000 && WiFi.status() != WL_CONNECTED) delay(200);
 
@@ -1040,9 +1041,11 @@ static void showDiagScreen(const char* title) {
     }
 }
 
-// Volta ao viewfinder após foto/erro: mesmo modo do sensor, só garante exposição manual.
+// Volta ao viewfinder após foto/erro. Só escreve no sensor se a long exposure deixou o AE
+// automático ligado — fora isso, zero tráfego SCCB depois da foto (fase de pico de corrente).
+static bool camAeAuto = false;
 static void restoreViewfinder() {
-    camApplyVfExposure();
+    if (camAeAuto) { camApplyVfExposure(); camAeAuto = false; }
     vfNeedsClear = true;
 }
 
@@ -1202,8 +1205,7 @@ void takeLongExposureStacked() {
             s->set_agc_gain(s, 30);
             s->set_exposure_ctrl(s, 1);
             s->set_gain_ctrl(s, 1);
-            s->set_whitebal(s, 1);
-            s->set_awb_gain(s, 1);
+            camAeAuto = true;   // restoreViewfinder volta para manual
         }
     }
 
@@ -2300,7 +2302,12 @@ static void bootIntro() {
 void setup() {
     Serial.begin(115200);
     logOrigVprintf = esp_log_set_vprintf(logVprintf);   // erros do driver da câmera → log em RAM
-    dlog("[BOOT] rst=%d heap=%u", esp_reset_reason(), esp_get_free_heap_size());
+    esp_reset_reason_t rst = esp_reset_reason();
+    dlog("[BOOT] rst=%d (%s) heap=%u", rst,
+         rst == ESP_RST_POWERON  ? "poweron"  : rst == ESP_RST_SW    ? "sw"    :
+         rst == ESP_RST_BROWNOUT ? "BROWNOUT" : rst == ESP_RST_PANIC ? "panic" :
+         (rst == ESP_RST_INT_WDT || rst == ESP_RST_TASK_WDT || rst == ESP_RST_WDT) ? "wdt" : "?",
+         esp_get_free_heap_size());
     pinMode(BTN_PIN,   INPUT_PULLUP);
     pinMode(LED_FLASH, OUTPUT);
     digitalWrite(LED_FLASH, LOW);
@@ -2315,7 +2322,7 @@ void setup() {
     photoBuf = nullptr;
 
     // ── Fases 1 e 2 ──────────────────────────────────────────────────────────
-    bootIntro();
+    if (rst != ESP_RST_SW) bootIntro();   // reinício de recuperação da câmera: sem intro, volta rápido
 
     // ── Fase 3 — CYBERSHOT DIY + verificação dos sistemas ───────────────────
     tft.fillScreen(ST77XX_BLACK);
@@ -2436,6 +2443,7 @@ void switchToDirectAP() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
     WiFi.softAP("CYBERSHOT");   // sem senha — acesso direto
+    WiFi.setTxPower(WIFI_POWER_15dBm);
     wifiOK    = true;
     wifiAP    = true;
     wifiSetup = false;
@@ -2960,8 +2968,8 @@ void loop() {
     static uint32_t dbgFrames = 0;
     dbgFrames++;
     if (millis() - lastDbg >= 5000) {
-        dlog("[VF] fps %u luma %d aec %d g %d heap %u", dbgFrames / 5, vfLastLuma,
-             vfAecValue, vfAgcGain, esp_get_free_heap_size());
+        dlog("[VF] fps %u luma %d aec %d g %d ev %d heap %u", dbgFrames / 5, vfLastLuma,
+             vfAecValue, vfAgcGain, evComp, esp_get_free_heap_size());
         dbgFrames = 0;
         lastDbg = millis();
     }
@@ -2974,14 +2982,12 @@ void loop() {
     unsigned long tf = millis();
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
-        // sem frame = sensor travado. 1ª vez: XCLK desligado por 4 s (é o que o boot faz e
-        // sempre volta) + init completo; se repetir, reinicia o ESP.
+        // sem frame por 8 s = sensor travado. Uma tentativa rápida de init; se o sensor não
+        // responde (probe falha) ou segue sem frames, reinicia o ESP — o boot sempre volta
+        // (e sem intro quando o reset é por software).
         vfFailCount++;
         dlog("[VF] no frame %lums (#%d)", millis() - tf, vfFailCount);
-        if (vfFailCount >= 2) { dlog("[VF] restart"); delay(100); ESP.restart(); }
-        esp_camera_deinit();
-        delay(4000);
-        initCamera();
+        if (vfFailCount >= 2 || !initCamera()) { dlog("[VF] restart"); delay(100); ESP.restart(); }
         delay(5);
         return;
     }
