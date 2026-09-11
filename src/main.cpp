@@ -353,10 +353,14 @@ static void sccbBusRecover() {
     sccbBusInit();
 }
 
+// Barramento SCCB: 0 = o próprio driver (100 kHz, como no build que rodou de manhã);
+// 1 = barramento próprio a 50 kHz (sccbBusInit). Teste A/B — 3 falhas em JPEG com o próprio.
+#define SCCB_OWN_BUS 0
+
 bool initCamera() {
     esp_camera_deinit();
     delay(50);
-    sccbBusInit();
+    if (SCCB_OWN_BUS) sccbBusInit();
 
     camera_config_t cfg = {};
     cfg.ledc_channel  = LEDC_CHANNEL_0;
@@ -373,8 +377,8 @@ bool initCamera() {
     cfg.pin_pclk      = PCLK_GPIO_NUM;
     cfg.pin_vsync     = VSYNC_GPIO_NUM;
     cfg.pin_href      = HREF_GPIO_NUM;
-    cfg.pin_sccb_sda  = -1;              // -1: usa o barramento I2C próprio (sccbBusInit)
-    cfg.pin_sccb_scl  = -1;
+    cfg.pin_sccb_sda  = SCCB_OWN_BUS ? -1 : SIOD_GPIO_NUM;   // -1: barramento próprio
+    cfg.pin_sccb_scl  = SCCB_OWN_BUS ? -1 : SIOC_GPIO_NUM;
     cfg.sccb_i2c_port = I2C_NUM_0;
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
