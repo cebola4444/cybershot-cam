@@ -31,6 +31,7 @@
 #include "img_converters.h"
 #include "SD_MMC.h"
 #include "esp_log.h"
+#include "driver/i2c.h"
 
 DNSServer    dnsServer;
 Preferences  wifiPrefs;
@@ -300,26 +301,53 @@ static void camDropFrames(int n) {
     }
 }
 
+// ─── Barramento SCCB próprio ─────────────────────────────────────────────────
+// O driver da câmera usa I2C a 100 kHz com os pull-ups internos do ESP32 (~45 kΩ): bordas
+// lentas, margem apertada — uma transação corrompida pode cair num registrador crítico e
+// travar o OV2640 (os travamentos no log coincidem com escritas de exposição). Barramento
+// próprio a 50 kHz, persistente entre deinit/init (o driver não o destrói), com recuperação
+// por pulsos quando o probe falha.
+static bool sccbBusReady = false;
+
+static void sccbBusInit() {
+    if (sccbBusReady) return;
+    i2c_config_t c = {};
+    c.mode             = I2C_MODE_MASTER;
+    c.sda_io_num       = SIOD_GPIO_NUM;
+    c.scl_io_num       = SIOC_GPIO_NUM;
+    c.sda_pullup_en    = GPIO_PULLUP_ENABLE;
+    c.scl_pullup_en    = GPIO_PULLUP_ENABLE;
+    c.master.clk_speed = 50000;
+    esp_err_t e = i2c_param_config(I2C_NUM_0, &c);
+    if (e == ESP_OK) e = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+    sccbBusReady = (e == ESP_OK);
+    if (!sccbBusReady) dlog("[SCCB] bus init fail 0x%x", e);
+}
+
+// Recuperação I2C (spec): 9 pulsos de SCL + STOP com os pinos em GPIO; depois reinstala.
+static void sccbBusRecover() {
+    if (sccbBusReady) { i2c_driver_delete(I2C_NUM_0); sccbBusReady = false; }
+    const gpio_num_t scl = (gpio_num_t)SIOC_GPIO_NUM;
+    const gpio_num_t sda = (gpio_num_t)SIOD_GPIO_NUM;
+    gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
+    gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+    gpio_set_level(sda, 1);
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(scl, 0); delayMicroseconds(10);
+        gpio_set_level(scl, 1); delayMicroseconds(10);
+    }
+    gpio_set_level(sda, 0); delayMicroseconds(10);   // STOP: SDA↓ com SCL↑, depois SDA↑
+    gpio_set_level(sda, 1); delayMicroseconds(10);
+    dlog("[SCCB] bus recover");
+    sccbBusInit();
+}
+
 bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCount) {
     esp_camera_deinit();
     delay(50);
-
-    // I2C bus recovery: pulsa SCL 9× para liberar SDA presa pelo OV2640
-    // necessário pois PWDN e RESET são -1 (sem pinos de reset de hardware)
-    {
-        const gpio_num_t scl = (gpio_num_t)SIOC_GPIO_NUM;
-        const gpio_num_t sda = (gpio_num_t)SIOD_GPIO_NUM;
-        gpio_set_direction(scl, GPIO_MODE_OUTPUT);
-        gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
-        gpio_set_level(sda, 1);
-        for (int i = 0; i < 9; i++) {
-            gpio_set_level(scl, 0); delayMicroseconds(5);
-            gpio_set_level(scl, 1); delayMicroseconds(5);
-        }
-        gpio_set_level(sda, 0); delayMicroseconds(5);  // STOP: SDA↓ com SCL↑
-        gpio_set_level(scl, 1); delayMicroseconds(5);
-        gpio_set_level(sda, 1); delayMicroseconds(5);  // SDA↑ = bus livre
-    }
+    sccbBusInit();
 
     camera_config_t cfg = {};
     cfg.ledc_channel  = LEDC_CHANNEL_0;
@@ -336,14 +364,15 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     cfg.pin_pclk      = PCLK_GPIO_NUM;
     cfg.pin_vsync     = VSYNC_GPIO_NUM;
     cfg.pin_href      = HREF_GPIO_NUM;
-    cfg.pin_sccb_sda  = SIOD_GPIO_NUM;
-    cfg.pin_sccb_scl  = SIOC_GPIO_NUM;
+    cfg.pin_sccb_sda  = -1;              // -1: usa o barramento I2C próprio (sccbBusInit)
+    cfg.pin_sccb_scl  = -1;
+    cfg.sccb_i2c_port = I2C_NUM_0;
     cfg.pin_pwdn      = PWDN_GPIO_NUM;
     cfg.pin_reset     = RESET_GPIO_NUM;
 
-    // VF em 10 MHz (calibração de exposição do VF); JPEG em 20 MHz com aec ×2 (calibração
-    // antiga das fotos). O driver faz soft-reset e reprograma o sensor inteiro a cada init.
-    cfg.xclk_freq_hz = (fmt == PIXFORMAT_JPEG) ? 20000000 : 10000000;
+    // 10 MHz nos dois modos: na foto (UXGA) o aec 1200 vale ~1/8 s — o dobro de luz do que
+    // a 20 MHz, menos ganho/ruído no escuro. O driver faz soft-reset a cada init.
+    cfg.xclk_freq_hz = 10000000;
 
     cfg.pixel_format = fmt;
     // JPEG: o driver dimensiona o frame buffer por w*h/5 do frame_size do init. XGA daria
@@ -359,6 +388,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
     esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
         dlog("[CAM] init fail 0x%x %s", err, fmt == PIXFORMAT_JPEG ? "JPEG" : "RGB");
+        sccbBusRecover();
         delay(300);
         err = esp_camera_init(&cfg);
         if (err != ESP_OK) {
@@ -388,7 +418,7 @@ bool initCamera(pixformat_t fmt, framesize_t size, uint8_t quality, uint8_t fbCo
             s->set_whitebal(s, 1);    // AWB ligado — corrige dominância de cor
             s->set_awb_gain(s, 1);
             s->set_wb_mode(s, 0);
-            s->set_aec_value(s, min(1200, vfAecValue * 2));   // XCLK 2× → aec 2×
+            s->set_aec_value(s, vfAecValue);   // mesmo XCLK do VF; o laço de medição refina
             s->set_agc_gain(s, vfAgcGain);
         }
     }
@@ -1202,7 +1232,7 @@ static bool initJpegForCapture(uint8_t fbCount) {
 static camera_fb_t* grabCaptureFrame(const char* label, int pct) {
     drawCaptureStatus(label, pct);
     if (!initJpegForCapture(1)) return nullptr;
-    int aec = min(1200, vfAecValue * 2), gain = vfAgcGain;
+    int aec = vfAecValue, gain = vfAgcGain;
     int target = aeTarget();
     for (int it = 0; it < 3; it++) {
         camDropFrames(1);   // latência do sensor ao aplicar aec/gain
